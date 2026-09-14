@@ -1,0 +1,1 @@
+web: gunicorn voice_server:app

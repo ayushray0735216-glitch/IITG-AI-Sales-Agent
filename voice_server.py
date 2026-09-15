@@ -1,4 +1,6 @@
 import os
+import pandas as pd
+from datetime import datetime
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from dotenv import load_dotenv
@@ -13,6 +15,86 @@ client = genai.Client(
 app = Flask(__name__)
 
 conversation_history = {}
+call_leads = {}
+def load_leads():
+    """Load the lead database."""
+    return pd.read_csv("leads.csv")
+
+
+def update_voice_lead(lead_name, status, last_action):
+    """Update a lead after a voice interaction."""
+
+    if not lead_name:
+        return False
+
+    leads = load_leads()
+
+    leads["Status"] = leads["Status"].astype("object")
+    leads["Last Action"] = leads["Last Action"].astype("object")
+    leads["Last Interaction"] = leads["Last Interaction"].astype("object")
+
+    for index, lead in leads.iterrows():
+
+        if str(lead["Name"]).strip().lower() == str(lead_name).strip().lower():
+
+            leads.at[index, "Status"] = status
+            leads.at[index, "Last Action"] = last_action
+            leads.at[index, "Last Interaction"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            leads.to_csv("leads.csv", index=False)
+
+            print(
+                f"Lead updated: {lead['Name']} | "
+                f"Status: {status} | "
+                f"Action: {last_action}"
+            )
+
+            return True
+
+    print(f"Lead not found: {lead_name}")
+    return False
+
+def load_leads():
+    """Load the lead database."""
+    return pd.read_csv("leads.csv")
+
+
+def update_voice_lead(lead_name, status, last_action):
+    """Update a lead after a voice interaction."""
+
+    if not lead_name:
+        return False
+
+    leads = load_leads()
+
+    leads["Status"] = leads["Status"].astype("object")
+    leads["Last Action"] = leads["Last Action"].astype("object")
+    leads["Last Interaction"] = leads["Last Interaction"].astype("object")
+
+    for index, lead in leads.iterrows():
+
+        if str(lead["Name"]).strip().lower() == str(lead_name).strip().lower():
+
+            leads.at[index, "Status"] = status
+            leads.at[index, "Last Action"] = last_action
+            leads.at[index, "Last Interaction"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            leads.to_csv("leads.csv", index=False)
+
+            print(
+                f"Lead updated: {lead['Name']} | "
+                f"Status: {status} | "
+                f"Action: {last_action}"
+            )
+
+            return True
+
+    print(f"Lead not found: {lead_name}")
+    return False
 
 def classify_intent(customer_message):
     prompt = f"""
@@ -84,6 +166,11 @@ Return only what should be spoken aloud to the customer.
 def voice():
     response = VoiceResponse()
 
+    lead_name = request.values.get("lead", "").strip()
+    call_sid = request.values.get("CallSid", "unknown")
+
+    if lead_name:
+        call_leads[call_sid] = lead_name
     gather = Gather(
         input="speech",
         action="https://iitg-ai-sales-agent.onrender.com/process",
@@ -129,6 +216,7 @@ def get_sales_action(intent):
 def process():
     speech = request.values.get("SpeechResult", "")
     call_sid = request.values.get("CallSid", "unknown")
+    lead_name = call_leads.get(call_sid, "")
 
     response = VoiceResponse()
 
@@ -163,6 +251,23 @@ def process():
 
         # Step 2: Automatically determine sales action
         sales_action = get_sales_action(intent)
+        status_map = {
+            "Close Lead": "Closed",
+            "Schedule Follow-up": "Follow-up",
+            "Send Pricing": "Contacted",
+            "Send Information": "Contacted",
+            "Schedule Demo": "Demo Requested",
+            "Escalate to Human": "Escalated",
+            "No Action": "New"
+        }
+
+        lead_status = status_map.get(sales_action, "Contacted")
+
+        update_voice_lead(
+            lead_name,
+            lead_status,
+            sales_action
+    )
 
         print(f"Intent [{call_sid}]: {intent}")
         print(f"Sales Action [{call_sid}]: {sales_action}")

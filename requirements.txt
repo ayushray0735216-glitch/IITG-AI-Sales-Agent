@@ -1,5 +1,7 @@
-Flask
+streamlit
+flask
 twilio
-python-dotenv
 google-genai
+python-dotenv
 gunicorn
+pandas

@@ -12,22 +12,27 @@ client = genai.Client(
 
 app = Flask(__name__)
 
-def get_ai_response(customer_message):
-    prompt = f"""
-You are a professional B2B sales assistant for IITG.
+conversation_history = {}
 
-The customer is speaking with you on a phone call.
+def classify_intent(customer_message):
+    prompt = f"""
+Classify the customer's message into exactly ONE of these categories:
+
+Interested
+Pricing Question
+Product Question
+Request for Demo
+Request for More Information
+Not Interested
+Ready to Buy
+Objection
+Technical Issue / Support Request
+Other
 
 Customer message:
 {customer_message}
 
-Respond naturally and conversationally.
-Keep the response concise because this is a voice call.
-Do not invent prices, features, discounts, guarantees, or other facts.
-Ask a relevant follow-up question when appropriate.
-Do not use markdown, bullet points, or headings.
-
-Return only the sentence(s) that should be spoken to the customer.
+Return only the category name. Do not add explanations.
 """
 
     response = client.models.generate_content(
@@ -36,6 +41,44 @@ Return only the sentence(s) that should be spoken to the customer.
     )
 
     return response.text.strip()
+    
+def get_ai_response(customer_message, history=None):
+    if history is None:
+        history = []
+    prompt = f"""
+You are the AI sales assistant for IITG.
+
+You are speaking with a customer on a live B2B sales call.
+
+Your goals are to:
+- Understand the customer's intent.
+- Answer questions about the product clearly.
+- Handle objections professionally.
+- Identify whether the customer is interested, asking about pricing, asking about the product, requesting a demo, requesting more information, not interested, ready to buy, or raising a concern.
+- Move the conversation naturally toward the appropriate next sales step.
+
+Conversation history:
+{chr(10).join([f"Customer: {item['customer']}\nAssistant: {item['assistant']}" for item in history])}
+
+Current customer message:
+{customer_message}
+
+Respond naturally and conversationally.
+Keep the response short because this is a phone call.
+Do not invent prices, features, discounts, guarantees, ROI, savings, or other unsupported facts.
+If you do not have enough information, say so and ask a relevant question.
+Do not use markdown, bullet points, or headings.
+
+Return only what should be spoken aloud to the customer.
+"""
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt
+    )
+
+    return response.text.strip()
+
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
@@ -64,22 +107,88 @@ def voice():
     return str(response)
 
 
-@app.route("/process", methods=["POST"])
+def get_sales_action(intent):
+    """Map customer intent to the appropriate sales action."""
+
+    action_map = {
+        "Interested": "Schedule Follow-up",
+        "Pricing Question": "Send Pricing",
+        "Product Question": "Send Information",
+        "Request for Demo": "Schedule Demo",
+        "Request for More Information": "Send Information",
+        "Not Interested": "Close Lead",
+        "Ready to Buy": "Escalate to Human",
+        "Objection": "Schedule Follow-up",
+        "Technical Issue / Support Request": "Escalate to Human",
+        "Other": "No Action"
+    }
+
+    return action_map.get(intent, "No Action")
+
+@app.route("/process", methods=["GET", "POST"])
 def process():
     speech = request.values.get("SpeechResult", "")
+    call_sid = request.values.get("CallSid", "unknown")
 
     response = VoiceResponse()
 
+    history = conversation_history.setdefault(call_sid, [])
+
     if speech:
-        ai_reply = get_ai_response(speech)
+        print(f"Customer [{call_sid}]: {speech}")
+
+        # Step 1: Identify customer intent
+        intent = classify_intent(speech)
+
+        # Step 2: Automatically determine sales action
+        sales_action = get_sales_action(intent)
+
+        print(f"Intent [{call_sid}]: {intent}")
+        print(f"Sales Action [{call_sid}]: {sales_action}")
+
+        # Step 3: Generate context-aware response
+        ai_reply = get_ai_response(
+            f"""
+Customer intent: {intent}
+Recommended sales action: {sales_action}
+Customer message: {speech}
+""",
+            history
+        )
+
+        print(f"AI [{call_sid}]: {ai_reply}")
+
+        # Step 4: Store conversation memory
+        history.append({
+            "customer": speech,
+            "assistant": ai_reply,
+            "intent": intent,
+            "sales_action": sales_action
+        })
+
+        # Step 5: Speak response
         response.say(ai_reply)
+
+        # Step 6: Continue conversation
+        gather = Gather(
+            input="speech",
+            action="https://dust-relive-nappy.ngrok-free.dev/process",
+            method="POST",
+            speech_timeout="auto",
+            language="en-IN"
+        )
+
+        gather.say(
+            "How else can I help you?"
+        )
+
+        response.append(gather)
 
     else:
         response.say(
-            "I could not understand your response. Goodbye."
+            "I didn't hear a response. Thank you for calling. Goodbye."
         )
-
-    response.redirect("https://dust-relive-nappy.ngrok-free.dev/voice", method="POST")
+        response.hangup()
 
     return str(response)
 

@@ -223,7 +223,7 @@ def process():
     history = conversation_history.setdefault(call_sid, [])
 
     if speech:
-                # Detect when the customer wants to end the call
+        # Detect when the customer wants to end the call
         end_call_phrases = [
             "hang up",
             "hangup",
@@ -243,7 +243,7 @@ def process():
             )
             response.hangup()
             return str(response)
-        
+
         print(f"Customer [{call_sid}]: {speech}")
 
         # Step 1: Identify customer intent
@@ -267,7 +267,7 @@ def process():
             lead_name,
             lead_status,
             sales_action
-    )
+        )
 
         print(f"Intent [{call_sid}]: {intent}")
         print(f"Sales Action [{call_sid}]: {sales_action}")
@@ -296,6 +296,24 @@ Customer message: {speech}
         response.say(ai_reply)
 
         # Step 6: Continue conversation
+        follow_up_map = {
+            "Interested": "Would you like me to arrange a brief follow-up call?",
+            "Pricing Question": "Would you like me to help you with the pricing details?",
+            "Product Question": "Would you like me to clarify anything specific about the product?",
+            "Request for Demo": "Would you like to discuss a suitable time for the demo?",
+            "Request for More Information": "Would you like me to send you the relevant information?",
+            "Not Interested": "Understood. Thank you for your time.",
+            "Ready to Buy": "Would you like me to connect you with a member of our sales team?",
+            "Objection": "Would you like to discuss that concern further?",
+            "Technical Issue / Support Request": "Would you like me to connect you with our support team?",
+            "Other": "Is there anything specific you'd like to know?"
+        }
+
+        follow_up = follow_up_map.get(
+            intent,
+            "Is there anything specific you'd like to know?"
+        )
+
         gather = Gather(
             input="speech",
             action="https://iitg-ai-sales-agent.onrender.com/process",
@@ -304,10 +322,7 @@ Customer message: {speech}
             language="en-IN"
         )
 
-        gather.say(
-            "How else can I help you?"
-        )
-
+        gather.say(follow_up)
         response.append(gather)
 
     else:

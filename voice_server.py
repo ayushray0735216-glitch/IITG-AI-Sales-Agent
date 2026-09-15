@@ -251,6 +251,12 @@ def process():
 
         # Step 2: Automatically determine sales action
         sales_action = get_sales_action(intent)
+        if intent == "Not Interested":
+            response.say(
+                "Understood. Thank you for your time. We won't follow up further regarding this request. Goodbye."
+            )
+            response.hangup()
+            return str(response)
         status_map = {
             "Close Lead": "Closed",
             "Schedule Follow-up": "Follow-up",

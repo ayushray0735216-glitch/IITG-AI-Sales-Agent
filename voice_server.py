@@ -135,6 +135,27 @@ def process():
     history = conversation_history.setdefault(call_sid, [])
 
     if speech:
+                # Detect when the customer wants to end the call
+        end_call_phrases = [
+            "hang up",
+            "hangup",
+            "end the call",
+            "end call",
+            "goodbye",
+            "bye",
+            "disconnect",
+            "you can go",
+            "that's all",
+            "that is all"
+        ]
+
+        if any(phrase in speech.lower() for phrase in end_call_phrases):
+            response.say(
+                "Thank you for your time. Goodbye."
+            )
+            response.hangup()
+            return str(response)
+        
         print(f"Customer [{call_sid}]: {speech}")
 
         # Step 1: Identify customer intent

@@ -86,7 +86,7 @@ def voice():
 
     gather = Gather(
         input="speech",
-        action="https://dust-relive-nappy.ngrok-free.dev/process",
+        action="https://iitg-ai-sales-agent.onrender.com/process",
         method="POST",
         speech_timeout="auto",
         language="en-IN"
@@ -172,7 +172,7 @@ Customer message: {speech}
         # Step 6: Continue conversation
         gather = Gather(
             input="speech",
-            action="https://dust-relive-nappy.ngrok-free.dev/process",
+            action="https://iitg-ai-sales-agent.onrender.com/process",
             method="POST",
             speech_timeout="auto",
             language="en-IN"

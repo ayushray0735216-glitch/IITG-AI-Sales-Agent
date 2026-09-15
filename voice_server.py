@@ -251,6 +251,27 @@ def process():
 
         # Step 2: Automatically determine sales action
         sales_action = get_sales_action(intent)
+
+        # Step 2.5: Update the lead record
+        lead_name = call_leads.get(call_sid, "")
+
+        if sales_action != "No Action":
+            status_map = {
+                "Schedule Follow-up": "Interested",
+                "Send Pricing": "Pricing Requested",
+                "Send Information": "Information Requested",
+                "Schedule Demo": "Demo Requested",
+                "Close Lead": "Closed",
+                "Escalate to Human": "Needs Human Review"
+            }
+
+            lead_status = status_map.get(sales_action, "Contacted")
+
+            update_voice_lead(
+                lead_name,
+                lead_status,
+                sales_action
+            )
         if intent == "Not Interested":
             response.say(
                 "Understood. Thank you for your time. We won't follow up further regarding this request. Goodbye."

@@ -1,7 +1,13 @@
 import os
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request
+from twilio.rest import Client as TwilioClient
+import threading
+import time
+import re
+import smtplib
+from email.message import EmailMessage
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from dotenv import load_dotenv
 from google import genai
@@ -16,6 +22,7 @@ app = Flask(__name__)
 
 conversation_history = {}
 call_leads = {}
+call_numbers = {}
 def load_leads():
     """Load the lead database."""
     return pd.read_csv("leads.csv")
@@ -95,6 +102,236 @@ def update_voice_lead(lead_name, status, last_action):
 
     print(f"Lead not found: {lead_name}")
     return False
+# ============================================================
+# VOICE CALLBACK SCHEDULING
+# ============================================================
+
+scheduled_voice_calls = {}
+
+
+def parse_voice_call_time(message):
+    """Understand relative and explicit callback times."""
+
+    message_lower = message.lower().strip()
+    now = datetime.now()
+
+    # -----------------------------------------
+    # Relative time
+    # -----------------------------------------
+
+    relative_match = re.search(
+        r"(?:after|in)\s+(\d+)\s+(minute|minutes|hour|hours)",
+        message_lower
+    )
+
+    if relative_match:
+
+        value = int(relative_match.group(1))
+        unit = relative_match.group(2)
+
+        if "hour" in unit:
+            return now + timedelta(hours=value)
+
+        return now + timedelta(minutes=value)
+
+    # -----------------------------------------
+    # Today / tomorrow
+    # -----------------------------------------
+
+    if "tomorrow" in message_lower:
+        target_date = now.date() + timedelta(days=1)
+
+    else:
+        target_date = now.date()
+
+    # -----------------------------------------
+    # Exact time
+    # -----------------------------------------
+
+    time_match = re.search(
+        r"(?:at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+        message_lower
+    )
+
+    if not time_match:
+        return None
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    period = time_match.group(3)
+
+    if period:
+
+        if period == "pm" and hour != 12:
+            hour += 12
+
+        elif period == "am" and hour == 12:
+            hour = 0
+
+    scheduled_time = datetime.combine(
+        target_date,
+        datetime.min.time()
+    ).replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+    # If no explicit date was given and the time has passed,
+    # schedule for tomorrow.
+    if (
+        "tomorrow" not in message_lower
+        and scheduled_time <= now
+    ):
+        scheduled_time += timedelta(days=1)
+
+    if scheduled_time <= now:
+        return None
+
+    return scheduled_time
+
+
+def send_voice_confirmation_email(lead_name, scheduled_time):
+
+    leads = load_leads()
+
+    for _, lead in leads.iterrows():
+
+        if str(lead["Name"]).strip().lower() == str(
+            lead_name
+        ).strip().lower():
+
+            email = str(lead.get("Email", "")).strip()
+
+            if not email:
+                return "Lead email not found."
+
+            sender_email = os.getenv("EMAIL_ADDRESS")
+            sender_password = os.getenv("EMAIL_PASSWORD")
+
+            if not sender_email or not sender_password:
+                return "Email credentials not configured."
+
+            msg = EmailMessage()
+
+            msg["From"] = sender_email
+            msg["To"] = email
+            msg["Subject"] = (
+                "Call Rescheduled - IITG AI Sales Agent"
+            )
+
+            msg.set_content(
+                f"Hello {lead_name},\n\n"
+                "As requested, your call has been rescheduled "
+                f"for {scheduled_time.strftime('%d %B %Y at %I:%M %p')}.\n\n"
+                "Please keep your phone available around the "
+                "scheduled time.\n\n"
+                "Regards,\n"
+                "IITG AI Sales Agent"
+            )
+
+            try:
+
+                with smtplib.SMTP_SSL(
+                    "smtp.gmail.com",
+                    465
+                ) as smtp:
+
+                    smtp.login(
+                        sender_email,
+                        sender_password
+                    )
+
+                    smtp.send_message(msg)
+
+                return "Email sent successfully."
+
+            except Exception as e:
+
+                return f"Email failed: {e}"
+
+    return "Lead not found."
+
+
+def initiate_scheduled_voice_call(lead_name, to_number):
+
+    try:
+
+        twilio_client = TwilioClient(
+            os.getenv("TWILIO_ACCOUNT_SID"),
+            os.getenv("TWILIO_AUTH_TOKEN")
+        )
+
+        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+
+        if not to_number or not from_number:
+            return False, "Phone number is not configured."
+
+        if not to_number or not from_number:
+            return False, "Phone number is not configured."
+
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=from_number,
+            url=(
+                "https://iitg-ai-sales-agent.onrender.com"
+                f"/voice?lead={lead_name}"
+            )
+        )
+
+        return True, call.sid
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+def schedule_voice_callback(
+    lead_name,
+    scheduled_time,
+    to_number
+):
+
+    def wait_and_call():
+
+        wait_seconds = (
+            scheduled_time - datetime.now()
+        ).total_seconds()
+
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        success, result = (
+            initiate_scheduled_voice_call(
+                lead_name,
+                to_number
+            )
+        )
+
+        scheduled_voice_calls[lead_name] = {
+            "scheduled_time": scheduled_time,
+            "status": (
+                "Called"
+                if success
+                else "Failed"
+            ),
+            "result": result
+        }
+
+    thread = threading.Thread(
+        target=wait_and_call,
+        daemon=True
+    )
+
+    thread.start()
+
+    scheduled_voice_calls[lead_name] = {
+        "scheduled_time": scheduled_time,
+        "status": "Scheduled"
+    }
+
+    return True
 
 def classify_intent(customer_message):
     prompt = f"""
@@ -168,9 +405,13 @@ def voice():
 
     lead_name = request.values.get("lead", "").strip()
     call_sid = request.values.get("CallSid", "unknown")
+    caller_number = request.values.get("From", "").strip()
 
     if lead_name:
         call_leads[call_sid] = lead_name
+
+    if caller_number:
+        call_numbers[call_sid] = caller_number
     gather = Gather(
         input="speech",
         action="https://iitg-ai-sales-agent.onrender.com/process",
@@ -223,6 +464,94 @@ def process():
     history = conversation_history.setdefault(call_sid, [])
 
     if speech:
+                # -----------------------------------------
+        # SMART CALLBACK / RESCHEDULING
+        # -----------------------------------------
+
+        scheduled_time = parse_voice_call_time(
+            speech
+        )
+
+        callback_phrases = [
+            "call me later",
+            "call me tomorrow",
+            "call me today",
+            "call me again",
+            "call me after",
+            "call me in",
+            "call again",
+            "reschedule",
+            "reschedule the call",
+            "i am busy",
+            "i'm busy",
+            "i cannot talk",
+            "i can't talk",
+            "unable to talk",
+            "not able to talk",
+            "not available right now",
+            "busy right now"
+        ]
+
+        is_callback_request = any(
+            phrase in speech.lower()
+            for phrase in callback_phrases
+        )
+
+        if (
+            is_callback_request
+            and scheduled_time
+            and lead_name
+        ):
+            caller_number = call_numbers.get(
+                call_sid,
+                ""
+            )
+
+            schedule_voice_callback(
+                lead_name,
+                scheduled_time,
+                caller_number
+            )
+
+            update_voice_lead(
+                lead_name,
+                "Call Scheduled",
+                "Reschedule Call"
+            )
+
+            email_status = (
+                send_voice_confirmation_email(
+                    lead_name,
+                    scheduled_time
+                )
+            )
+
+            formatted_time = (
+                scheduled_time.strftime(
+                    "%d %B %Y at %I:%M %p"
+                )
+            )
+
+            print(
+                f"Callback scheduled [{call_sid}]: "
+                f"{formatted_time}"
+            )
+
+            print(
+                f"Confirmation email [{call_sid}]: "
+                f"{email_status}"
+            )
+
+            response.say(
+                f"Of course. I've rescheduled your call "
+                f"for {formatted_time}. "
+                "You will also receive a confirmation email. "
+                "Thank you."
+            )
+
+            response.hangup()
+
+            return str(response)
         # Detect when the customer wants to end the call
         end_call_phrases = [
             "hang up",
@@ -272,6 +601,7 @@ def process():
                 lead_status,
                 sales_action
             )
+            
         if intent == "Not Interested":
             response.say(
                 "Understood. Thank you for your time. We won't follow up further regarding this request. Goodbye."

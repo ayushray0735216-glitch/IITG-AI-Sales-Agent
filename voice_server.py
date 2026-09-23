@@ -480,16 +480,30 @@ def process():
             "call me after",
             "call me in",
             "call again",
+
+            "schedule the call",
+            "schedule a call",
+            "schedule my call",
+            "schedule the call after",
+            "schedule the call in",
+            "schedule a call after",
+            "schedule a call in",
+
             "reschedule",
             "reschedule the call",
+            "reschedule my call",
+
             "i am busy",
             "i'm busy",
+            "i don't have time",
+            "i do not have time",
             "i cannot talk",
             "i can't talk",
             "unable to talk",
             "not able to talk",
             "not available right now",
-            "busy right now"
+            "busy right now",
+            "call me back"
         ]
 
         is_callback_request = any(

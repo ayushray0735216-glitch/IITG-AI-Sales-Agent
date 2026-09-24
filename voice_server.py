@@ -1,6 +1,8 @@
 import os
 import pandas as pd
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+IST = ZoneInfo("Asia/Kolkata")
 from flask import Flask, request
 from twilio.rest import Client as TwilioClient
 import threading
@@ -113,7 +115,7 @@ def parse_voice_call_time(message):
     """Understand relative and explicit callback times."""
 
     message_lower = message.lower().strip()
-    now = datetime.now()
+    now = datetime.now(IST)
 
     # -----------------------------------------
     # Relative time
@@ -296,7 +298,7 @@ def schedule_voice_callback(
     def wait_and_call():
 
         wait_seconds = (
-            scheduled_time - datetime.now()
+            scheduled_time - datetime.now(IST)
         ).total_seconds()
 
         if wait_seconds > 0:

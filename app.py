@@ -24,6 +24,8 @@ if "uploaded_file_name" not in st.session_state:
 
 load_dotenv()
 
+print("DEVELOPER_PASSWORD configured:", bool(os.getenv("DEVELOPER_PASSWORD")))
+
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
 )

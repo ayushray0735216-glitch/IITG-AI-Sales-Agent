@@ -9,6 +9,8 @@ import smtplib
 import threading
 import time
 import re
+import hmac
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 
 if "leads" not in st.session_state:
@@ -26,13 +28,15 @@ client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
 )
 
+IST = ZoneInfo("Asia/Kolkata")
+
 scheduled_calls = {}
 
 def parse_call_time(message):
     """Convert a customer's call-time request into a future datetime."""
 
     message_lower = message.lower().strip()
-    now = datetime.now()
+    now = datetime.now(IST)
 
     # -----------------------------------------
     # RELATIVE TIME
@@ -134,7 +138,7 @@ def schedule_demo_call(lead_name, scheduled_time):
     """Schedule a Twilio call for a specific future time."""
 
     def wait_and_call():
-        wait_seconds = (scheduled_time - datetime.now()).total_seconds()
+        wait_seconds = (scheduled_time - datetime.now(IST)).total_seconds()
 
         if wait_seconds > 0:
             time.sleep(wait_seconds)
@@ -1081,7 +1085,7 @@ SENDER_COMPANY = "IITG AI Sales Agent"
 st.set_page_config(
     page_title="IITG AI Sales Assistant",
     page_icon="🤖",
-    layout="centered"
+    layout="wide"
 )
 
 # -----------------------------
@@ -1096,6 +1100,56 @@ if "customer_messages" not in st.session_state:
 
 if "customer_lead" not in st.session_state:
     st.session_state["customer_lead"] = None
+
+developer_mode = st.query_params.get("mode", "customer") == "developer"
+
+if developer_mode and not st.session_state.get("developer_authenticated", False):
+    developer_password = os.getenv("DEVELOPER_PASSWORD")
+
+    st.title("?? Developer Console")
+    st.caption("Private CRM, lead management, sales activity, and AI analytics")
+
+    if not developer_password:
+        st.error("DEVELOPER_PASSWORD is not configured.")
+        st.stop()
+
+    entered_password = st.text_input(
+        "Developer Password",
+        type="password"
+    )
+
+    if st.button(
+        "Unlock Developer Console",
+        type="primary"
+    ):
+        if hmac.compare_digest(
+            entered_password,
+            developer_password
+        ):
+            st.session_state["developer_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()
+
+if developer_mode:
+
+    st.sidebar.title("??? Developer")
+
+    if st.sidebar.button(
+        "?? Refresh Dashboard",
+        width="stretch"
+    ):
+        st.rerun()
+
+    if st.sidebar.button(
+        "?? Sign Out",
+        width="stretch"
+    ):
+        st.session_state["developer_authenticated"] = False
+        st.rerun()
+
 
 
 # -----------------------------
@@ -1156,7 +1210,7 @@ st.markdown(
 # CUSTOMER NAME
 # -----------------------------
 
-if not st.session_state["customer_name"]:
+if not developer_mode and not st.session_state["customer_name"]:
 
     st.markdown(
         """
@@ -1204,9 +1258,154 @@ if not st.session_state["customer_name"]:
 # CHAT INTERFACE
 # ============================================================
 
-elif not st.session_state.get("show_dashboard", False):
+elif not developer_mode:
 
     customer_name = st.session_state["customer_name"]
+
+    # -----------------------------
+    # CUSTOMER CALL CONTROLS
+    # -----------------------------
+
+    with st.sidebar:
+
+        st.markdown("Contact Sales")
+
+        active_lead = st.session_state.get(
+            "customer_lead"
+        )
+
+        if st.button(
+            "Call me now",
+            width="stretch",
+            disabled=not active_lead
+        ):
+
+            success, result = initiate_demo_call(
+                active_lead["Name"]
+            )
+
+            if success:
+
+                update_lead_record(
+                    "Customer requested an immediate call.",
+                    "Call Initiated",
+                    "Initiate Call",
+                    active_lead["Name"],
+                    None,
+                    "Call Request",
+                    "Positive",
+                )
+
+                record_action(
+                    "Call initiated.",
+                    lead=active_lead,
+                    intent="Call Request",
+                    sentiment="Positive",
+                    priority=""
+                )
+
+                st.success(
+                    "Your call is being connected."
+                )
+
+            else:
+
+                st.error(
+                    f"Call failed: {result}"
+                )
+
+        with st.expander(
+            "Schedule a call",
+            expanded=False
+        ):
+
+            if not active_lead:
+
+                st.info(
+                    "Start a conversation first."
+                )
+
+            else:
+
+                today = datetime.now(
+                    IST
+                ).date()
+
+                call_date = st.date_input(
+                    "Date (IST)",
+                    value=today,
+                    min_value=today
+                )
+
+                call_time = st.time_input(
+                    "Time (IST)",
+                    value=datetime.now(
+                        IST
+                    ).replace(
+                        second=0,
+                        microsecond=0
+                    ).time()
+                )
+
+                if st.button(
+                    "Confirm scheduled call",
+                    type="primary",
+                    width="stretch"
+                ):
+
+                    scheduled_datetime = datetime.combine(
+                        call_date,
+                        call_time
+                    ).replace(
+                        tzinfo=IST
+                    )
+
+                    if scheduled_datetime <= datetime.now(
+                        IST
+                    ):
+
+                        st.error(
+                            "Please choose a future time."
+                        )
+
+                    else:
+
+                        success, result = schedule_demo_call(
+                            active_lead["Name"],
+                            scheduled_datetime
+                        )
+
+                        if success:
+
+                            update_lead_record(
+                                "Customer scheduled a call.",
+                                "Call Scheduled",
+                                "Schedule Call",
+                                active_lead["Name"],
+                                None,
+                                "Call Request",
+                                "Positive",
+                            )
+
+                            record_action(
+                                "Call scheduled.",
+                                lead=active_lead,
+                                intent="Call Request",
+                                sentiment="Positive",
+                                priority=""
+                            )
+
+                            st.success(
+                                "Call scheduled for "
+                                f"{scheduled_datetime.strftime('%d %b %Y, %I:%M %p')} IST"
+                            )
+
+                        else:
+
+                            st.error(
+                                f"Could not schedule call: {result}"
+                            )
+
 
     # -----------------------------
     # TOP CUSTOMER BAR
@@ -1234,36 +1433,6 @@ elif not st.session_state.get("show_dashboard", False):
 
         with st.chat_message(message["role"]):
             st.write(message["content"])
-
-    # -----------------------------
-    # AI SALES ANALYSIS
-    # -----------------------------
-
-    if "last_analysis" in st.session_state:
-
-        analysis_data = st.session_state["last_analysis"]
-
-        with st.expander("🤖 AI Sales Analysis", expanded=True):
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.write(
-                    f"**Intent:** {analysis_data['intent']}"
-                )
-                st.write(
-                    f"**Sentiment:** {analysis_data['sentiment']}"
-                )
-
-            with col2:
-                st.write(
-                    f"**Priority:** {analysis_data['priority']}"
-                )
-                st.write(
-                    f"**Recommended Action:** "
-                    f"{analysis_data['recommended_action']}"
-                )
-
 
     # -----------------------------
     # CUSTOMER MESSAGE
@@ -1505,21 +1674,11 @@ elif not st.session_state.get("show_dashboard", False):
             st.rerun()
 
 
-    with col2:
-
-        if st.button(
-            "📊 Sales Dashboard",
-            width="stretch"
-        ):
-
-            st.session_state["show_dashboard"] = True
-            st.rerun()
-
     # ============================================================
     # SALES DASHBOARD
     # ============================================================
 
-if st.session_state.get("show_dashboard", False):
+if developer_mode and st.session_state.get("developer_authenticated", False):
 
     st.divider()
 

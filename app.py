@@ -265,7 +265,7 @@ def record_action(action, lead=None, intent="", sentiment="", priority=""):
             activity_file,
             index=False
         )
-        
+
     sync_after_csv_write("sales_activity.csv")
 
 
@@ -840,7 +840,12 @@ def load_leads():
     """Load and normalize the active lead database."""
 
     if "leads" not in st.session_state:
-        st.session_state["leads"] = pd.read_csv(crm_path("leads.csv"))
+        leads_file = crm_path("leads.csv")
+
+        if os.path.exists(leads_file):
+            st.session_state["leads"] = pd.read_csv(leads_file)
+        else:
+            st.session_state["leads"] = pd.DataFrame()
 
     leads = st.session_state["leads"]
 

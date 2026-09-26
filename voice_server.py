@@ -13,8 +13,10 @@ from email.message import EmailMessage
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from dotenv import load_dotenv
 from google import genai
-
 load_dotenv()
+from crm_storage import crm_path, ensure_seed_file
+
+ensure_seed_file("leads.csv")
 
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
@@ -27,7 +29,7 @@ call_leads = {}
 call_numbers = {}
 def load_leads():
     """Load the lead database."""
-    return pd.read_csv("leads.csv")
+    return pd.read_csv(crm_path("leads.csv"))
 
 
 def update_voice_lead(lead_name, status, last_action):
@@ -52,7 +54,7 @@ def update_voice_lead(lead_name, status, last_action):
                 "%Y-%m-%d %H:%M:%S"
             )
 
-            leads.to_csv("leads.csv", index=False)
+            leads.to_csv(crm_path("leads.csv"), index=False)
 
             print(
                 f"Lead updated: {lead['Name']} | "
@@ -67,7 +69,7 @@ def update_voice_lead(lead_name, status, last_action):
 
 def load_leads():
     """Load the lead database."""
-    return pd.read_csv("leads.csv")
+    return pd.read_csv(crm_path("leads.csv"))
 
 
 def update_voice_lead(lead_name, status, last_action):
@@ -92,7 +94,7 @@ def update_voice_lead(lead_name, status, last_action):
                 "%Y-%m-%d %H:%M:%S"
             )
 
-            leads.to_csv("leads.csv", index=False)
+            leads.to_csv(crm_path("leads.csv"), index=False)
 
             print(
                 f"Lead updated: {lead['Name']} | "

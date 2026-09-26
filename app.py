@@ -12,9 +12,19 @@ import re
 import hmac
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
+load_dotenv()
+from crm_storage import (
+    crm_path,
+    ensure_seed_file,
+    initialize_database,
+    sync_after_csv_write,
+)
+
+ensure_seed_file("leads.csv")
+initialize_database()
 
 if "leads" not in st.session_state:
-    st.session_state["leads"] = pd.read_csv("leads.csv")
+    st.session_state["leads"] = pd.read_csv(crm_path("leads.csv"))
 
 if "using_uploaded_leads" not in st.session_state:
     st.session_state["using_uploaded_leads"] = False
@@ -239,7 +249,7 @@ def record_action(action, lead=None, intent="", sentiment="", priority=""):
     st.session_state["action_log"].append(activity)
 
     # Persist activity to CSV
-    activity_file = "sales_activity.csv"
+    activity_file = crm_path("sales_activity.csv")
 
     activity_df = pd.DataFrame([activity])
 
@@ -255,6 +265,73 @@ def record_action(action, lead=None, intent="", sentiment="", priority=""):
             activity_file,
             index=False
         )
+        
+    sync_after_csv_write("sales_activity.csv")
+
+
+def merge_crm_upload(uploaded_file, filename):
+    """Import CRM CSV rows without removing existing records or values."""
+    incoming = pd.read_csv(uploaded_file)
+    destination = crm_path(filename)
+
+    if filename == "sales_activity.csv":
+        current = (
+            pd.read_csv(destination)
+            if os.path.exists(destination)
+            else pd.DataFrame(columns=incoming.columns)
+        )
+        before = len(current)
+        merged = pd.concat([current, incoming], ignore_index=True, sort=False)
+        merged = merged.drop_duplicates(keep="first")
+        merged.to_csv(destination, index=False)
+        sync_after_csv_write(filename)
+        return len(merged) - before
+
+    if filename != "leads.csv" or "Name" not in incoming.columns:
+        raise ValueError("The leads file must contain a Name column.")
+
+    current = (
+        pd.read_csv(destination)
+        if os.path.exists(destination)
+        else pd.DataFrame(columns=incoming.columns)
+    )
+    columns = list(dict.fromkeys([*current.columns, *incoming.columns]))
+    current = current.reindex(columns=columns).astype("object")
+    incoming = incoming.reindex(columns=columns)
+    def lead_key(row):
+        email = row.get("Email")
+        if not pd.isna(email) and str(email).strip():
+            return "email:" + str(email).strip().casefold()
+        name = row.get("Name")
+        if not pd.isna(name) and str(name).strip():
+            return "name:" + str(name).strip().casefold()
+        return ""
+
+    current_positions = {}
+    for index, row in current.iterrows():
+        key = lead_key(row)
+        if key:
+            current_positions[key] = index
+
+    added = 0
+    for _, imported in incoming.iterrows():
+        key = lead_key(imported)
+        if not key or key not in current_positions:
+            current = pd.concat([current, imported.to_frame().T], ignore_index=True)
+            if key:
+                current_positions[key] = len(current) - 1
+            added += 1
+            continue
+
+        row_index = current_positions[key]
+        for column, value in imported.items():
+            old_value = current.at[row_index, column]
+            if pd.isna(old_value) or not str(old_value).strip():
+                current.at[row_index, column] = value
+
+    current.to_csv(destination, index=False)
+    sync_after_csv_write(filename)
+    return added
 
 
 def update_lead_record(
@@ -269,7 +346,7 @@ def update_lead_record(
 ):
     """Update the matched lead and persist changes to the default CSV."""
 
-    leads = pd.read_csv("leads.csv")
+    leads = pd.read_csv(crm_path("leads.csv"))
 
     required_columns = [
         "Status",
@@ -319,8 +396,8 @@ def update_lead_record(
                 False
             ):
             
-                leads.to_csv("leads.csv", index=False)
-        
+                leads.to_csv(crm_path("leads.csv"), index=False)
+                sync_after_csv_write("leads.csv")
             st.session_state["leads"] = leads.copy()
 
             st.session_state["customer_lead"] = (
@@ -763,7 +840,7 @@ def load_leads():
     """Load and normalize the active lead database."""
 
     if "leads" not in st.session_state:
-        st.session_state["leads"] = pd.read_csv("leads.csv")
+        st.session_state["leads"] = pd.read_csv(crm_path("leads.csv"))
 
     leads = st.session_state["leads"]
 
@@ -1108,7 +1185,12 @@ developer_mode = st.query_params.get("mode", "customer") == "developer"
 if developer_mode and not st.session_state.get("developer_authenticated", False):
     developer_password = os.getenv("DEVELOPER_PASSWORD")
 
-    st.title("?? Developer Console")
+    st.markdown(
+        '<div style="color:#17324d;font-size:2rem;font-weight:750;'
+        'letter-spacing:-0.03em;margin:0.6rem 0 0.25rem;">'
+        'Developer Console</div>',
+        unsafe_allow_html=True,
+    )
     st.caption("Private CRM, lead management, sales activity, and AI analytics")
 
     if not developer_password:
@@ -1137,16 +1219,16 @@ if developer_mode and not st.session_state.get("developer_authenticated", False)
 
 if developer_mode:
 
-    st.sidebar.title("??? Developer")
+    st.sidebar.title("Developer")
 
     if st.sidebar.button(
-        "?? Refresh Dashboard",
+        "Refresh dashboard",
         width="stretch"
     ):
         st.rerun()
 
     if st.sidebar.button(
-        "?? Sign Out",
+        "Sign out",
         width="stretch"
     ):
         st.session_state["developer_authenticated"] = False
@@ -1187,6 +1269,33 @@ st.markdown(
         margin-bottom: 4px;
     }
 
+    .developer-login-title {
+        color: #17324d;
+        font-size: 2rem;
+        font-weight: 750;
+        letter-spacing: -0.03em;
+        margin: 0.6rem 0 0.25rem;
+    }
+
+    .developer-console-header {
+        border: 1px solid rgba(70, 110, 150, 0.22);
+        border-radius: 16px;
+        padding: 1.1rem 1.35rem;
+        margin: 0.5rem 0 1.2rem;
+        background: linear-gradient(115deg, rgba(35, 91, 130, 0.12), rgba(99, 82, 160, 0.07));
+    }
+
+    .developer-console-header h1 {
+        margin: 0;
+        font-size: 1.75rem;
+        letter-spacing: -0.03em;
+    }
+
+    .developer-console-header p {
+        margin: 0.35rem 0 0;
+        opacity: 0.75;
+    }
+
     </style>
     """,
     unsafe_allow_html=True
@@ -1197,15 +1306,16 @@ st.markdown(
 # HEADER
 # -----------------------------
 
-st.markdown(
-    '<div class="main-title">🤖 IITG AI Sales Assistant</div>',
-    unsafe_allow_html=True
-)
+if not developer_mode:
+    st.markdown(
+        '<div class="main-title">🤖 IITG AI Sales Assistant</div>',
+        unsafe_allow_html=True
+    )
 
-st.markdown(
-    '<div class="subtitle">Your intelligent sales assistant</div>',
-    unsafe_allow_html=True
-)
+    st.markdown(
+        '<div class="subtitle">Your intelligent sales assistant</div>',
+        unsafe_allow_html=True
+    )
 
 
 # -----------------------------
@@ -1684,15 +1794,18 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
 
     st.divider()
 
-    st.title("📊 Sales Dashboard")
-    st.caption("IITG AI Sales Agent — CRM & Sales Activity Overview")
+    st.markdown(
+        '<div class="developer-console-header"><h1>Sales workspace</h1>'
+        '<p>Lead management, customer activity and sales insights</p></div>',
+        unsafe_allow_html=True,
+    )
 
     # -----------------------------------------
     # LOAD CURRENT CRM DATA
     # -----------------------------------------
 
     try:
-        dashboard_leads = pd.read_csv("leads.csv")
+        dashboard_leads = pd.read_csv(crm_path("leads.csv"))
         if "Last Sentiment" not in dashboard_leads.columns:
             dashboard_leads["Last Sentiment"] = ""
     except Exception:
@@ -1702,17 +1815,52 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     # LOAD SALES ACTIVITY
     # -----------------------------------------
 
-    if os.path.exists("sales_activity.csv"):
+    if os.path.exists(crm_path("sales_activity.csv")):
 
         try:
             dashboard_activity = pd.read_csv(
-                "sales_activity.csv"
+                crm_path("sales_activity.csv")
             )
         except Exception:
             dashboard_activity = pd.DataFrame()
 
     else:
         dashboard_activity = pd.DataFrame()
+
+    with st.expander("Restore local CRM data", expanded=False):
+        st.caption(
+            "Import CSVs from your previous workspace. Existing lead values are kept; "
+            "missing values and new leads are added. Activity rows are appended without duplicates."
+        )
+        leads_upload = st.file_uploader(
+            "Leads CSV", type=["csv"], key="crm_leads_restore"
+        )
+        activity_upload = st.file_uploader(
+            "Sales activity CSV", type=["csv"], key="crm_activity_restore"
+        )
+        if st.button("Import selected files", key="crm_restore_button"):
+            imported_counts = []
+            try:
+                if leads_upload is not None:
+                    imported_counts.append(
+                        f"{merge_crm_upload(leads_upload, 'leads.csv')} new lead(s)"
+                    )
+                if activity_upload is not None:
+                    imported_counts.append(
+                        f"{merge_crm_upload(activity_upload, 'sales_activity.csv')} new activity row(s)"
+                    )
+                if imported_counts:
+                    st.success("Imported " + " and ".join(imported_counts) + ".")
+                    st.rerun()
+                st.info("Choose at least one CSV file to import.")
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+
+    if not os.getenv("CRM_DATA_DIR"):
+        st.warning(
+            "CRM files are stored on this service's local filesystem. Configure "
+            "CRM_DATA_DIR to point to persistent storage before relying on redeploy-safe data."
+        )
 
     # -----------------------------------------
     # KPI METRICS

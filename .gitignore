@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# Local CRM data and backups
+sales_activity.csv
+app_backup_*.py
+leads.csv

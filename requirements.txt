@@ -5,3 +5,4 @@ google-genai
 python-dotenv
 gunicorn
 pandas
+psycopg2-binary

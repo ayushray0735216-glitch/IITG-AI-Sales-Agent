@@ -1828,12 +1828,30 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     # LOAD CURRENT CRM DATA
     # -----------------------------------------
 
-    try:
-        dashboard_leads = pd.read_csv(crm_path("leads.csv"))
-        if "Last Sentiment" not in dashboard_leads.columns:
-            dashboard_leads["Last Sentiment"] = ""
-    except Exception:
-        dashboard_leads = pd.DataFrame()
+    dashboard_leads = st.session_state.get(
+    "leads",
+    pd.DataFrame()
+).copy()
+
+required_dashboard_columns = [
+    "Name",
+    "Company",
+    "Industry",
+    "Job Role",
+    "Email",
+    "Product",
+    "Status",
+    "Last Action",
+    "Last Interaction",
+    "Priority",
+    "Last Intent",
+    "Last Sentiment",
+    "Notes",
+]
+
+for column in required_dashboard_columns:
+    if column not in dashboard_leads.columns:
+        dashboard_leads[column] = ""
 
     # -----------------------------------------
     # LOAD SALES ACTIVITY

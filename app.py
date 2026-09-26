@@ -1829,29 +1829,29 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     # -----------------------------------------
 
     dashboard_leads = st.session_state.get(
-    "leads",
-    pd.DataFrame()
-).copy()
+        "leads",
+        pd.DataFrame()
+    ).copy()
 
-required_dashboard_columns = [
-    "Name",
-    "Company",
-    "Industry",
-    "Job Role",
-    "Email",
-    "Product",
-    "Status",
-    "Last Action",
-    "Last Interaction",
-    "Priority",
-    "Last Intent",
-    "Last Sentiment",
-    "Notes",
-]
+    required_dashboard_columns = [
+        "Name",
+        "Company",
+        "Industry",
+        "Job Role",
+        "Email",
+        "Product",
+        "Status",
+        "Last Action",
+        "Last Interaction",
+        "Priority",
+        "Last Intent",
+        "Last Sentiment",
+        "Notes",
+    ]
 
-for column in required_dashboard_columns:
-    if column not in dashboard_leads.columns:
-        dashboard_leads[column] = ""
+    for column in required_dashboard_columns:
+        if column not in dashboard_leads.columns:
+            dashboard_leads[column] = ""
 
     # -----------------------------------------
     # LOAD SALES ACTIVITY
@@ -1898,10 +1898,11 @@ for column in required_dashboard_columns:
             except Exception as exc:
                 st.error(f"Import failed: {exc}")
 
-    if not os.getenv("CRM_DATA_DIR"):
+    if os.getenv("DATABASE_URL"):
+        st.success("CRM database: PostgreSQL connected")
+    else:
         st.warning(
-            "CRM files are stored on this service's local filesystem. Configure "
-            "CRM_DATA_DIR to point to persistent storage before relying on redeploy-safe data."
+            "CRM database: local CSV storage. Configure DATABASE_URL for persistent CRM storage."
         )
 
     # -----------------------------------------
@@ -2104,15 +2105,26 @@ for column in required_dashboard_columns:
         key="dashboard_intent_filter"
     )
 
+    # -----------------------------------------
+    # SENTIMENT FILTER
+    # -----------------------------------------
+
+    sentiment_series = dashboard_leads.get(
+        "Last Sentiment",
+        pd.Series(dtype=str)
+    )
+
+    sentiment_values = sorted(
+        {
+            str(x).strip()
+            for x in sentiment_series.dropna().unique()
+            if str(x).strip()
+        }
+    )
+
     selected_sentiment = st.selectbox(
         "😊 Sentiment",
-        ["All"] + sorted(
-            [
-                str(x).strip()
-                for x in dashboard_leads["Last Sentiment"].dropna().unique()
-                if str(x).strip()
-            ]
-        ),
+        ["All"] + sentiment_values,
         key="dashboard_sentiment_filter"
     )
 
@@ -2592,7 +2604,7 @@ for column in required_dashboard_columns:
                     scheduled_datetime = datetime.combine(
                         followup_date,
                         followup_time
-                    )
+                    ).replace(tzinfo=IST)
 
                     if scheduled_datetime <= datetime.now():
 

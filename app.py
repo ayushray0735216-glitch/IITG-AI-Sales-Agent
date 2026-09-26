@@ -1875,7 +1875,7 @@ for column in required_dashboard_columns:
             "missing values and new leads are added. Activity rows are appended without duplicates."
         )
         leads_upload = st.file_uploader(
-            "Leads CSV", type=["csv"], key="crm_leads_restore"
+            "Leads CSV", type=["csv"], key="crm_leads_restore_2"
         )
         activity_upload = st.file_uploader(
             "Sales activity CSV", type=["csv"], key="crm_activity_restore"

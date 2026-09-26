@@ -29,7 +29,21 @@ if "leads" not in st.session_state:
     if os.path.exists(leads_file):
         st.session_state["leads"] = pd.read_csv(leads_file)
     else:
-        st.session_state["leads"] = pd.DataFrame()
+        st.session_state["leads"] = pd.DataFrame(columns=[
+            "Name",
+            "Company",
+            "Industry",
+            "Job Role",
+            "Email",
+            "Product",
+            "Status",
+            "Last Action",
+            "Last Interaction",
+            "Priority",
+            "Last Intent",
+            "Last Sentiment",
+            "Notes",
+        ])
 
 if "using_uploaded_leads" not in st.session_state:
     st.session_state["using_uploaded_leads"] = False

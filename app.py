@@ -24,7 +24,12 @@ ensure_seed_file("leads.csv")
 initialize_database()
 
 if "leads" not in st.session_state:
-    st.session_state["leads"] = pd.read_csv(crm_path("leads.csv"))
+    leads_file = crm_path("leads.csv")
+
+    if os.path.exists(leads_file):
+        st.session_state["leads"] = pd.read_csv(leads_file)
+    else:
+        st.session_state["leads"] = pd.DataFrame()
 
 if "using_uploaded_leads" not in st.session_state:
     st.session_state["using_uploaded_leads"] = False

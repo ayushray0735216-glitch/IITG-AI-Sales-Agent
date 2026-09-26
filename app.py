@@ -1828,10 +1828,12 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     # LOAD CURRENT CRM DATA
     # -----------------------------------------
 
-    dashboard_leads = st.session_state.get(
-        "leads",
-        pd.DataFrame()
-    ).copy()
+    try:
+        dashboard_leads = pd.read_csv(
+            crm_path("leads.csv")
+        )
+    except Exception:
+        dashboard_leads = pd.DataFrame()
 
     required_dashboard_columns = [
         "Name",
@@ -1886,6 +1888,11 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
                 if leads_upload is not None:
                     imported_counts.append(
                         f"{merge_crm_upload(leads_upload, 'leads.csv')} new lead(s)"
+                    )
+
+                    # Refresh the in-memory lead data after CRM import
+                    st.session_state["leads"] = pd.read_csv(
+                        crm_path("leads.csv")
                     )
                 if activity_upload is not None:
                     imported_counts.append(

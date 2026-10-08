@@ -7,3 +7,14 @@ venv/
 sales_activity.csv
 app_backup_*.py
 leads.csv
+conversation_history.csv
+email_inbox.csv
+*.bak
+email_materials/
+autopilot_settings.json
+autopilot_actions.csv
+autopilot_queue.sqlite3
+autopilot_queue.sqlite3-wal
+autopilot_queue.sqlite3-shm
+autopilot_worker*.log
+.streamlit/secrets.toml

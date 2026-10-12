@@ -934,7 +934,9 @@ def record_action(action, lead=None, intent="", sentiment="", priority=""):
         st.session_state["action_log"] = []
 
     activity = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # Store an explicit offset so CRM events remain correctly sortable and
+        # readable when the app runs on a UTC-based cloud host.
+        "timestamp": datetime.now(IST).isoformat(timespec="seconds"),
         "lead": lead.get("Name", "") if lead is not None else "",
         "intent": intent,
         "sentiment": sentiment,
@@ -6045,11 +6047,28 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
             if column not in activity_history.columns:
                 activity_history[column] = ""
 
-        # Display newest activities first.
-        activity_history = activity_history.sort_values(
-            "timestamp",
-            ascending=False
+        # Older cloud rows may be naive UTC timestamps, while new rows include
+        # an explicit offset. Normalize both for sorting and show CRM times in IST.
+        raw_timestamps = activity_history["timestamp"].fillna("").astype(str)
+        parsed_timestamps = pd.to_datetime(
+            raw_timestamps,
+            format="mixed",
+            errors="coerce",
+            utc=True,
         )
+        activity_history["_timestamp_sort"] = parsed_timestamps
+        activity_history["timestamp"] = parsed_timestamps.dt.tz_convert(
+            IST
+        ).dt.strftime("%Y-%m-%d %H:%M:%S IST")
+        invalid_timestamps = parsed_timestamps.isna()
+        activity_history.loc[invalid_timestamps, "timestamp"] = raw_timestamps[
+            invalid_timestamps
+        ]
+        activity_history = activity_history.sort_values(
+            "_timestamp_sort",
+            ascending=False,
+            na_position="last",
+        ).drop(columns=["_timestamp_sort"])
 
         st.dataframe(
             activity_history[

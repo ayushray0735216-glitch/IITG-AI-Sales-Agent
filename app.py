@@ -4056,17 +4056,32 @@ def execute_and_update_sales_action(
             "Wishing you all the best."
         )
 
-    elif recommended_action == "No Action":
+    elif recommended_action in {
+        "Send Pricing",
+        "Send Information",
+        "Schedule Demo",
+        "No Action",
+    }:
+        # These handlers already return the customer-facing answer. Preserve it
+        # verbatim so a second model call cannot rewrite or omit verified facts.
+        customer_message_generated = str(action_result or "").strip()
 
-        # Keep out-of-scope redirects concise and independent of prior product context.
-        customer_message_generated = action_result
+    elif recommended_action == "Schedule Follow-up" and intent == "Ready to Buy":
+        customer_message_generated = (
+            "Thanks for your interest. I’ve recorded this as a high-priority "
+            "request. What would help you with the next step?"
+        )
+
+    elif recommended_action == "Escalate to Human":
+        customer_message_generated = (
+            "I’ve recorded your request as needing assistance from our team. "
+            "What would you like me to include for them?"
+        )
 
     else:
-
-        customer_message_generated = generate_customer_message(
-            customer_message,
-            action_result
-        )
+        # Interested and objection handlers already produce customer-facing
+        # replies, so keep those responses intact as well.
+        customer_message_generated = str(action_result or "").strip()
 
     if intent == "Ready to Buy":
         status = "Ready to Buy"

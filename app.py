@@ -2063,6 +2063,136 @@ def is_catalog_comparison_question(message):
     return any(phrase in message_lower for phrase in comparison_phrases)
 
 
+def is_catalog_listing_question(message):
+    """Detect broad requests for a list of current organization offerings."""
+
+    if is_catalog_comparison_question(message):
+        return False
+
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(message or "").casefold(),
+    ).strip()
+    listing_phrases = (
+        "what products and services do you offer",
+        "what products do you offer",
+        "what services do you offer",
+        "what do you offer",
+        "what products are available",
+        "what services are available",
+        "what courses do you offer",
+        "what courses are available",
+        "what workshops do you offer",
+        "what seminars do you offer",
+        "list your products",
+        "list your services",
+        "list your offerings",
+        "show me your products",
+        "show me your offerings",
+    )
+    return any(phrase in normalized for phrase in listing_phrases)
+
+
+def get_customer_visible_offerings(offerings=None):
+    """Return only published, AI-enabled offerings that are not over."""
+
+    if offerings is None:
+        offerings = load_offerings()
+
+    if offerings is None or offerings.empty:
+        return pd.DataFrame(columns=OFFERING_COLUMNS)
+
+    offerings = offerings.copy()
+    for column in OFFERING_COLUMNS:
+        if column not in offerings.columns:
+            offerings[column] = ""
+
+    offerings = refresh_offering_lifecycle(offerings)
+    knowledge_status = (
+        offerings["Knowledge Status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.casefold()
+    )
+    ai_active = offerings["AI Active"].apply(normalize_ai_active)
+    lifecycle = (
+        offerings["Lifecycle Status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.casefold()
+    )
+    unavailable = {"completed", "expired", "archived", "cancelled"}
+    return offerings[
+        (knowledge_status == "published")
+        & ai_active
+        & ~lifecycle.isin(unavailable)
+    ].copy()
+
+
+def build_catalog_listing_reply():
+    """Create a grounded, deterministic reply for broad catalog questions."""
+
+    visible_offerings = get_customer_visible_offerings()
+    if visible_offerings.empty:
+        return (
+            "I don’t have any currently published offerings available to list. "
+            "Our team can confirm the latest products, services, and programs."
+        )
+
+    def clean(value):
+        if value is None or pd.isna(value):
+            return ""
+        text = str(value).strip()
+        return "" if text.casefold() in {"", "nan", "nat", "none"} else text
+
+    entries = []
+    for _, offering in visible_offerings.head(12).iterrows():
+        name = clean(offering.get("Offering Name"))
+        kind = clean(offering.get("Offering Type"))
+        if not name:
+            continue
+
+        heading = f"{name} ({kind})" if kind else name
+        facts = []
+        description = clean(offering.get("Description"))
+        if description:
+            facts.append(description)
+
+        price = clean(offering.get("Price"))
+        currency = clean(offering.get("Currency"))
+        if price:
+            facts.append(f"Price: {price} {currency}".strip())
+
+        start_date = clean(offering.get("Start Date"))
+        end_date = clean(offering.get("End Date"))
+        if start_date or end_date:
+            dates = " to ".join(value for value in (start_date, end_date) if value)
+            facts.append(f"Dates: {dates}")
+
+        duration = clean(offering.get("Duration"))
+        if duration:
+            facts.append(f"Duration: {duration}")
+
+        entries.append(heading + (" - " + "; ".join(facts) if facts else ""))
+
+    if not entries:
+        return (
+            "I don’t have any currently published offerings available to list. "
+            "Our team can confirm the latest products, services, and programs."
+        )
+
+    reply = "Here are the current offerings I can help with:\n\n" + "\n".join(
+        f"- {entry}" for entry in entries
+    )
+    if len(visible_offerings) > len(entries):
+        reply += f"\n\nShowing {len(entries)} of {len(visible_offerings)} current offerings."
+    reply += "\n\nWhich one would you like to know more about?"
+    return reply
+
+
 def is_greeting_message(message):
     """Return True only when the message is a greeting without a question."""
 
@@ -2077,6 +2207,20 @@ def is_greeting_message(message):
         normalized in greeting_messages
         or bool(re.fullmatch(r"h+i+|he+y+|hell+o+|yo+", normalized))
     )
+
+
+def is_polite_acknowledgment(message):
+    """Recognize a standalone thank-you or brief acknowledgement."""
+
+    normalized = re.sub(r"[^a-z0-9' ]", " ", str(message or "").casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    acknowledgement_patterns = (
+        r"^(?:ok|okay|all right|alright|got it|understood|sure|great|perfect|cool)"
+        r"(?:\s+(?:thanks|thank you))?$",
+        r"^(?:thanks|thank you)(?:\s+(?:very much|so much|a lot))?$",
+        r"^(?:that is helpful|that's helpful)$",
+    )
+    return any(re.fullmatch(pattern, normalized) for pattern in acknowledgement_patterns)
 
 
 def is_registration_confirmation(message):
@@ -2143,6 +2287,15 @@ def analyze_customer_message(
     """Classify the customer message and recommend a controlled sales action."""
 
     if is_catalog_comparison_question(customer_message):
+        return {
+            "intent": "Product Question",
+            "sentiment": "Neutral",
+            "priority": "Medium",
+            "recommended_action": "Send Information",
+            "reply": "",
+        }
+
+    if is_catalog_listing_question(customer_message):
         return {
             "intent": "Product Question",
             "sentiment": "Neutral",
@@ -2410,6 +2563,9 @@ Return only the message that should be sent to the customer.
 
 def handle_information_request(customer_message, conversation_text=""):
 
+    if is_catalog_listing_question(customer_message):
+        return build_catalog_listing_reply()
+
     verified_knowledge = get_verified_offering_context(
         customer_message,
         conversation_text,
@@ -2515,6 +2671,9 @@ Return only the message that should be sent to the customer.
 
     return action
 def handle_product_question(customer_message, conversation_text=""):
+
+    if is_catalog_listing_question(customer_message):
+        return build_catalog_listing_reply()
 
     verified_knowledge = get_verified_offering_context(
         customer_message,
@@ -3564,7 +3723,10 @@ def load_offerings():
 
     try:
         offerings = load_offerings_data()
-    except Exception:
+    except Exception as exc:
+        # Keep the customer app available, but leave a safe diagnostic in
+        # Streamlit Cloud logs instead of silently hiding storage failures.
+        print(f"Offering catalog load failed ({type(exc).__name__}).")
         offerings = pd.DataFrame(
             columns=OFFERING_COLUMNS
         )
@@ -4778,6 +4940,17 @@ elif not developer_mode:
             )
             st.rerun()
 
+        if is_polite_acknowledgment(customer_message):
+            record_conversation_message(
+                "assistant",
+                (
+                    "You’re welcome! If another question comes up about a course, "
+                    "workshop, service, or event, just ask."
+                ),
+                lead,
+            )
+            st.rerun()
+
         # -----------------------------------------
         # CALL REQUEST
         # -----------------------------------------
@@ -5811,7 +5984,41 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
                 st.error(f"Import failed: {exc}")
 
     if os.getenv("DATABASE_URL"):
-        st.success("CRM database: PostgreSQL connected")
+        db_status_col, db_test_col = st.columns([3, 1])
+        with db_status_col:
+            st.info(
+                "CRM database URL is configured. Run the read-only check to verify the connection."
+            )
+        with db_test_col:
+            if st.button(
+                "Test database connection",
+                key="test_crm_database_connection",
+                width="stretch",
+            ):
+                connection = None
+                try:
+                    connection = crm_storage.get_connection()
+                    if connection is None:
+                        raise RuntimeError("DATABASE_URL is not available to the storage layer")
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT 1")
+                        ping_result = cursor.fetchone()
+                        cursor.execute("SELECT COUNT(*) FROM crm_offerings")
+                        offering_count = int(cursor.fetchone()[0])
+                    if not ping_result or ping_result[0] != 1:
+                        raise RuntimeError("The database did not return the expected ping result")
+                    st.success(
+                        "PostgreSQL connection verified. "
+                        f"Knowledge Center records: {offering_count}."
+                    )
+                except Exception as exc:
+                    st.error(
+                        "PostgreSQL connection check failed "
+                        f"({type(exc).__name__}). Check the app's DATABASE_URL secret and database access."
+                    )
+                finally:
+                    if connection is not None:
+                        connection.close()
     else:
         st.warning(
             "CRM database: local CSV storage. Configure DATABASE_URL for persistent CRM storage."
@@ -6306,6 +6513,9 @@ else:
 # ------------------------------------------------------------
 
 total_offerings = len(offerings_df)
+customer_ai_offerings = len(
+    get_customer_visible_offerings(offerings_df)
+)
 
 published_offerings = 0
 ai_active_offerings = 0
@@ -6338,7 +6548,7 @@ if not offerings_df.empty:
     )
 
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 
 with kpi1:
     st.metric(
@@ -6362,6 +6572,23 @@ with kpi4:
     st.metric(
         "Upcoming",
         upcoming_offerings
+    )
+
+with kpi5:
+    st.metric(
+        "Visible to chat AI",
+        customer_ai_offerings
+    )
+
+if not total_offerings:
+    st.info(
+        "The customer chat reads products, courses, and services from this Knowledge Center, "
+        "not from the lead list. Add offerings here to make them available to chat."
+    )
+elif not customer_ai_offerings:
+    st.warning(
+        "The customer chat cannot see any offerings yet. It uses only items that are "
+        "Published, AI Active, and not completed, archived, or cancelled."
     )
 
 

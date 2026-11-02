@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 import psycopg2
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -56,7 +56,32 @@ def get_connection():
     if not DATABASE_URL:
         return None
 
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=8)
+
+
+def upsert_crm_rows(filename: str, rows: list[dict]) -> None:
+    """Persist just changed rows; callers keep the local CSV copy."""
+    if not database_enabled() or not rows:
+        return
+    if filename not in {"leads.csv", "conversation_history.csv", "sales_activity.csv", "email_inbox.csv"}:
+        raise ValueError("Row updates are only supported for CRM records.")
+    values = {}
+    for row in rows:
+        # Match blank-cell normalization used by the existing CSV sync path.
+        data = {str(key): None if pd.isna(value) or value == "" else value for key, value in row.items()}
+        values[_row_key(filename, data)] = Json(data)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                f"INSERT INTO {_table_name(filename)} (row_key, data) VALUES %s "
+                "ON CONFLICT (row_key) DO UPDATE SET data = EXCLUDED.data",
+                list(values.items()), page_size=500,
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def initialize_database() -> None:
@@ -303,6 +328,7 @@ def sync_csv_to_database(
             if filename == "offerings.csv" and not only_if_empty:
                 cur.execute("DELETE FROM crm_offerings")
 
+            values = {}
             for _, row in df.iterrows():
                 data = {
                     str(k): (
@@ -313,15 +339,15 @@ def sync_csv_to_database(
 
                 key = _row_key(filename, data)
 
-                cur.execute(
-                    f"""
-                    INSERT INTO {table} (row_key, data)
-                    VALUES (%s, %s)
-                    ON CONFLICT (row_key)
-                    DO UPDATE SET data = EXCLUDED.data
-                    """,
-                    (key, Json(data)),
-                )
+                # Preserve the previous row-by-row behavior for duplicate IDs:
+                # the last row wins, with one upsert for each key.
+                values[key] = Json(data)
+            execute_values(
+                cur,
+                f"INSERT INTO {table} (row_key, data) VALUES %s "
+                "ON CONFLICT (row_key) DO UPDATE SET data = EXCLUDED.data",
+                list(values.items()), page_size=500,
+            )
 
         conn.commit()
 

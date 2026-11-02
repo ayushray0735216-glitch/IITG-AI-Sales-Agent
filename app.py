@@ -3587,7 +3587,70 @@ AI Active: {str(offering.get("AI Active", "")).strip()}
 
 
 def build_registration_link_reply(customer_message, conversation_text=""):
-    """Return a clickable link only when one is present in verified course data."""
+    """Return grounded registration links for a named offering or an all request."""
+
+    def clean_value(value):
+        if value is None or pd.isna(value):
+            return ""
+        value = str(value).strip()
+        return "" if value.casefold() in {"nan", "nat", "none", "null"} else value
+
+    def verified_url(value):
+        value = clean_value(value).rstrip(".,;!?)\\]}")
+        if not value:
+            return ""
+        if value.startswith("www."):
+            value = f"https://{value}"
+        elif not re.match(r"^https?://", value, flags=re.IGNORECASE):
+            value = f"https://{value}"
+        parsed = urlparse(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or "." not in parsed.hostname
+            or any(character.isspace() for character in value)
+        ):
+            return ""
+        return value
+
+    # A request for "each" refers to the visible catalog, not just the one
+    # offering that the normal contextual retriever happens to rank highest.
+    all_requested = bool(
+        re.search(r"\b(?:each|every|all)\b", str(customer_message or "").casefold())
+    )
+    if all_requested:
+        visible_offerings = get_customer_visible_offerings()
+        if visible_offerings.empty:
+            return (
+                "I don’t have any currently published offerings available to share links for. "
+                "Our team can confirm the latest offerings and follow up with you."
+            )
+
+        entries = []
+        for _, offering in visible_offerings.head(20).iterrows():
+            name = clean_value(offering.get("Offering Name"))
+            if not name:
+                continue
+            registration_url = verified_url(offering.get("Registration Link"))
+            if registration_url:
+                markdown_url = registration_url.replace("(", "%28").replace(")", "%29")
+                label = re.sub(r"[\[\]]", "", f"Open the {name} registration page")
+                detail = f"[{label}]({markdown_url})"
+            else:
+                detail = (
+                    "No registration link is listed for this offering. You can visit our website "
+                    "for more information, or ask our team to follow up with you."
+                )
+            entries.append(f"- **{name}:** {detail}")
+
+        if not entries:
+            return "I couldn’t find any named, published offerings to share. Our team can help with a follow-up."
+
+        reply = "Here are the registration details for our current offerings:\n\n" + "\n".join(entries)
+        if len(visible_offerings) > len(entries):
+            reply += f"\n\nShowing {len(entries)} of {len(visible_offerings)} current offerings."
+        return reply
 
     verified_context = get_verified_offering_context(
         customer_message,
@@ -3641,8 +3704,8 @@ def build_registration_link_reply(customer_message, conversation_text=""):
     registration_url = registration_url.strip().rstrip(r".,;!?)\]}>")
     if not registration_url or registration_url.casefold() in {"nan", "none", "null"}:
         return (
-            f"I couldn’t find a verified registration link for **{selected_name}**. Please check with "
-            "the sales team for the correct web address."
+            f"There isn’t a registration link listed for **{selected_name}**. You can visit our "
+            "website for more information, or share your contact details and ask our team to follow up."
         )
 
     if registration_url.startswith("www."):
@@ -3659,8 +3722,8 @@ def build_registration_link_reply(customer_message, conversation_text=""):
         or any(character.isspace() for character in registration_url)
     ):
         return (
-            f"The registration address saved for **{selected_name}** doesn’t appear to be a valid web "
-            "link. Please check with the sales team for the correct address."
+            f"There isn’t a usable registration link listed for **{selected_name}**. You can visit our "
+            "website for more information, or ask our team to follow up."
         )
 
     link_label = re.sub(r"[\[\]]", "", f"Open the {selected_name} registration page")

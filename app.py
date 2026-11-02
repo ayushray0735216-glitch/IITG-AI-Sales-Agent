@@ -4533,6 +4533,7 @@ if developer_mode:
         "[Restore CRM data](#restore-crm-data)  \n"
         "[Lead insights](#lead-metrics)  \n"
         "[Scheduled calls](#scheduled-calls)  \n"
+        "[Customer chat history](#customer-chat-history)  \n"
         "[Activity history](#sales-activity-history)  \n"
         "[Sales analytics](#sales-analytics)  \n"
         "[Knowledge center](#knowledge-center)  \n"
@@ -5817,6 +5818,192 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
             dashboard_conversations = pd.DataFrame()
     else:
         dashboard_conversations = pd.DataFrame()
+
+    st.markdown('<span id="customer-chat-history"></span>', unsafe_allow_html=True)
+    st.subheader("Customer chat history")
+    st.caption(
+        "Review saved conversations by customer. Shared names and contact details are matched "
+        "from the CRM; visitors who stay anonymous remain listed by visitor ID and first message time."
+    )
+
+    chat_history = dashboard_conversations.copy()
+    chat_columns = ["timestamp", "lead", "visitor_id", "role", "content"]
+    for column in chat_columns:
+        if column not in chat_history.columns:
+            chat_history[column] = ""
+    chat_history = chat_history[chat_columns].fillna("")
+    chat_history["timestamp"] = chat_history["timestamp"].astype(str).str.strip()
+    chat_history["visitor_id"] = chat_history["visitor_id"].astype(str).str.strip()
+    chat_history["lead"] = chat_history["lead"].astype(str).str.strip()
+    chat_history["content"] = chat_history["content"].astype(str)
+    chat_history["_parsed_timestamp"] = pd.to_datetime(
+        chat_history["timestamp"], errors="coerce", format="mixed"
+    )
+
+    def _chat_text(value):
+        if value is None or pd.isna(value):
+            return ""
+        return str(value).strip()
+
+    # Resolve names and contact details against the latest CRM lead row. This also
+    # renames earlier anonymous messages when a visitor later shares their details.
+    crm_profiles = {}
+    if not dashboard_leads.empty:
+        for _, profile in dashboard_leads.iterrows():
+            visitor_id = _chat_text(profile.get("Visitor ID", ""))
+            if visitor_id:
+                crm_profiles[visitor_id] = profile
+
+    def _customer_chat_group_key(message_row):
+        visitor_id = str(message_row.get("visitor_id", "") or "").strip()
+        if visitor_id:
+            return f"visitor:{visitor_id}"
+        legacy_name = str(message_row.get("lead", "") or "").strip()
+        parsed = message_row.get("_parsed_timestamp")
+        date_part = parsed.strftime("%Y-%m-%d") if pd.notna(parsed) else "unknown-date"
+        if legacy_name and not legacy_name.casefold().startswith("anonymous visitor"):
+            return f"legacy:{legacy_name.casefold()}:{date_part}"
+        if legacy_name:
+            return f"legacy-anonymous:{legacy_name.casefold()}:{date_part}"
+        # Rows without either identity are kept separate rather than merged into
+        # one misleading anonymous transcript.
+        return f"legacy-message:{message_row.name}"
+
+    if not chat_history.empty:
+        chat_history["_group_key"] = chat_history.apply(_customer_chat_group_key, axis=1)
+        chat_history.sort_values(
+            ["_parsed_timestamp", "timestamp"], inplace=True, na_position="first"
+        )
+
+    chat_search = st.text_input(
+        "Find a customer or message",
+        placeholder="Search name, visitor ID, email, phone, or message",
+        key="developer_customer_chat_search",
+    )
+
+    if chat_history.empty:
+        st.info("No customer chat messages have been saved yet. New conversations will appear here.")
+    else:
+        chat_sessions = []
+        for group_key, messages in chat_history.groupby("_group_key", sort=False, dropna=False):
+            messages = messages.sort_values(
+                ["_parsed_timestamp", "timestamp"], na_position="first"
+            )
+            visitor_id = next(
+                (_chat_text(value) for value in messages["visitor_id"] if _chat_text(value)),
+                "",
+            )
+            profile = crm_profiles.get(visitor_id)
+            profile_name = ""
+            profile_email = ""
+            profile_phone = ""
+            profile_whatsapp = ""
+            if profile is not None:
+                contact_name = _chat_text(profile.get("Contact Name", ""))
+                crm_name = _chat_text(profile.get("Name", ""))
+                profile_name = contact_name or crm_name
+                if profile_name.casefold().startswith("anonymous visitor"):
+                    profile_name = ""
+                profile_email = _chat_text(profile.get("Email", ""))
+                profile_phone = _chat_text(profile.get("Phone", ""))
+                profile_whatsapp = _chat_text(profile.get("WhatsApp Number", ""))
+            if not profile_name:
+                profile_name = next(
+                    (
+                        _chat_text(value)
+                        for value in messages["lead"]
+                        if _chat_text(value)
+                        and not _chat_text(value).casefold().startswith("anonymous visitor")
+                    ),
+                    "",
+                )
+
+            first_timestamp = next(
+                (_chat_text(value) for value in messages["timestamp"] if _chat_text(value)),
+                "Time unavailable",
+            )
+            latest_timestamp = next(
+                (
+                    _chat_text(value)
+                    for value in messages["timestamp"].iloc[::-1]
+                    if _chat_text(value)
+                ),
+                first_timestamp,
+            )
+            if profile_name:
+                display_name = profile_name
+            elif visitor_id:
+                display_name = f"{visitor_id} · {first_timestamp} IST"
+            else:
+                display_name = f"Visitor · {first_timestamp} IST"
+
+            search_text = " ".join(
+                [display_name, visitor_id, profile_email, profile_phone, profile_whatsapp]
+                + messages["content"].astype(str).tolist()
+            ).casefold()
+            if chat_search.strip().casefold() and chat_search.strip().casefold() not in search_text:
+                continue
+            chat_sessions.append(
+                {
+                    "key": str(group_key),
+                    "messages": messages,
+                    "visitor_id": visitor_id,
+                    "name": profile_name,
+                    "email": profile_email,
+                    "phone": profile_phone,
+                    "whatsapp": profile_whatsapp,
+                    "display_name": display_name,
+                    "first_timestamp": first_timestamp,
+                    "latest_timestamp": latest_timestamp,
+                }
+            )
+
+        chat_sessions.sort(
+            key=lambda session: int(
+                pd.to_datetime(
+                    session["latest_timestamp"], errors="coerce", format="mixed"
+                ).value
+            )
+            if session["latest_timestamp"] != "Time unavailable"
+            and pd.notna(
+                pd.to_datetime(
+                    session["latest_timestamp"], errors="coerce", format="mixed"
+                )
+            )
+            else -1,
+            reverse=True,
+        )
+        st.caption(f"{len(chat_sessions)} customer conversation(s)")
+        if not chat_sessions:
+            st.info("No conversations match that search.")
+        for session in chat_sessions:
+            messages = session["messages"]
+            heading = (
+                f"{session['display_name']} · {len(messages)} messages · "
+                f"Last message {session['latest_timestamp']} IST"
+            )
+            with st.expander(heading, expanded=False):
+                if session["name"]:
+                    st.markdown(f"**Customer:** {session['name']}")
+                if session["visitor_id"]:
+                    st.markdown(f"**Visitor ID:** `{session['visitor_id']}`")
+                if session["email"]:
+                    st.markdown(f"**Email:** {session['email']}")
+                if session["phone"]:
+                    st.markdown(f"**Phone:** {session['phone']}")
+                if session["whatsapp"]:
+                    st.markdown(f"**WhatsApp:** {session['whatsapp']}")
+                st.caption(
+                    f"Started {session['first_timestamp']} IST · "
+                    f"Latest activity {session['latest_timestamp']} IST"
+                )
+                st.divider()
+                for _, message in messages.iterrows():
+                    role = _chat_text(message.get("role", "")).casefold()
+                    speaker = "Customer" if role in {"user", "customer", "human"} else "AI assistant"
+                    timestamp = _chat_text(message.get("timestamp", "")) or "Time unavailable"
+                    st.markdown(f"**{speaker}** · {timestamp} IST")
+                    st.write(_chat_text(message.get("content", "")))
 
     st.markdown('<span id="email-inbox"></span>', unsafe_allow_html=True)
     with st.expander("Customer email inbox", expanded=False):

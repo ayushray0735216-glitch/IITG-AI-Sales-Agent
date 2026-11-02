@@ -984,12 +984,25 @@ def record_conversation_message(
         "content": message["content"],
     }
     history_file = crm_path("conversation_history.csv")
-    pd.DataFrame([row]).to_csv(
-        history_file,
-        mode="a",
-        header=not os.path.exists(history_file),
-        index=False,
-    )
+    if os.path.exists(history_file):
+        try:
+            history_columns = list(pd.read_csv(history_file, nrows=0).columns)
+        except Exception:
+            history_columns = []
+    else:
+        history_columns = []
+    if not history_columns:
+        history_columns = list(row)
+        pd.DataFrame([row], columns=history_columns).to_csv(
+            history_file, index=False
+        )
+    else:
+        # Reindex to the existing header before appending. Passing a dict row
+        # directly to to_csv can silently put values in a different order than
+        # an older CSV header after the schema has evolved.
+        pd.DataFrame([row]).reindex(columns=history_columns).to_csv(
+            history_file, mode="a", header=False, index=False
+        )
     sync_after_csv_write("conversation_history.csv")
 
 
@@ -2064,7 +2077,7 @@ def is_catalog_comparison_question(message):
 
 
 def is_catalog_listing_question(message):
-    """Detect broad requests for a list of current organization offerings."""
+    """Detect broad requests for all currently available catalog offerings."""
 
     if is_catalog_comparison_question(message):
         return False
@@ -2074,24 +2087,45 @@ def is_catalog_listing_question(message):
         " ",
         str(message or "").casefold(),
     ).strip()
-    listing_phrases = (
-        "what products and services do you offer",
-        "what products do you offer",
-        "what services do you offer",
-        "what do you offer",
-        "what products are available",
-        "what services are available",
-        "what courses do you offer",
-        "what courses are available",
-        "what workshops do you offer",
-        "what seminars do you offer",
-        "list your products",
-        "list your services",
-        "list your offerings",
-        "show me your products",
-        "show me your offerings",
+    catalog_terms = (
+        "product", "products", "service", "services", "offering", "offerings",
+        "course", "courses", "workshop", "workshops", "seminar", "seminars",
+        "program", "programs", "event", "events",
     )
-    return any(phrase in normalized for phrase in listing_phrases)
+    list_cues = (
+        "offer", "offering", "available", "provide", "sell", "have", "catalog",
+        "upcoming", "ongoing", "currently", "all",
+    )
+
+    # Accept natural variants such as "What products, or services are you
+    # offering?" so the request uses the complete CRM catalog instead of a
+    # language-model summary of whichever offerings retrieval happened to match.
+    begins_with_catalog_question = bool(
+        re.match(
+            r"^(?:what|which)\s+(?:(?:are|is)\s+)?"
+            r"(?:all\s+|current\s+|currently\s+|upcoming\s+|ongoing\s+|your\s+|the\s+)*"
+            r"(?:products?|services?|offerings?|courses?|workshops?|seminars?|programs?|events?)\b",
+            normalized,
+        )
+    )
+    asks_for_list = bool(
+        re.search(r"\b(?:list|show|name|tell me)\b", normalized)
+        and any(term in normalized.split() for term in catalog_terms)
+    )
+    asks_what_is_offered = (
+        begins_with_catalog_question
+        and any(re.search(rf"\b{cue}\b", normalized) for cue in list_cues)
+    ) or any(
+        phrase in normalized
+        for phrase in (
+            "what do you offer",
+            "what are you offering",
+            "what is currently offered",
+            "show me your offerings",
+            "list your offerings",
+        )
+    )
+    return asks_for_list or asks_what_is_offered
 
 
 def get_customer_visible_offerings(offerings=None):
@@ -2133,7 +2167,7 @@ def get_customer_visible_offerings(offerings=None):
 
 
 def build_catalog_listing_reply():
-    """Create a grounded, deterministic reply for broad catalog questions."""
+    """List every currently upcoming or ongoing CRM offering by name."""
 
     visible_offerings = get_customer_visible_offerings()
     if visible_offerings.empty:
@@ -2149,34 +2183,15 @@ def build_catalog_listing_reply():
         return "" if text.casefold() in {"", "nan", "nat", "none"} else text
 
     entries = []
-    for _, offering in visible_offerings.head(12).iterrows():
+    for _, offering in visible_offerings.iterrows():
         name = clean(offering.get("Offering Name"))
         kind = clean(offering.get("Offering Type"))
         if not name:
             continue
-
-        heading = f"{name} ({kind})" if kind else name
-        facts = []
-        description = clean(offering.get("Description"))
-        if description:
-            facts.append(description)
-
-        price = clean(offering.get("Price"))
-        currency = clean(offering.get("Currency"))
-        if price:
-            facts.append(f"Price: {price} {currency}".strip())
-
-        start_date = clean(offering.get("Start Date"))
-        end_date = clean(offering.get("End Date"))
-        if start_date or end_date:
-            dates = " to ".join(value for value in (start_date, end_date) if value)
-            facts.append(f"Dates: {dates}")
-
-        duration = clean(offering.get("Duration"))
-        if duration:
-            facts.append(f"Duration: {duration}")
-
-        entries.append(heading + (" - " + "; ".join(facts) if facts else ""))
+        lifecycle = clean(offering.get("Lifecycle Status"))
+        label = f" ({kind})" if kind else ""
+        status = f" — {lifecycle}" if lifecycle else ""
+        entries.append(f"- **{name}**{label}{status}")
 
     if not entries:
         return (
@@ -2184,12 +2199,11 @@ def build_catalog_listing_reply():
             "Our team can confirm the latest products, services, and programs."
         )
 
-    reply = "Here are the current offerings I can help with:\n\n" + "\n".join(
-        f"- {entry}" for entry in entries
+    reply = (
+        "Here are all currently upcoming or ongoing offerings in our catalog:\n\n"
+        + "\n".join(entries)
+        + "\n\nWhich one would you like to know more about?"
     )
-    if len(visible_offerings) > len(entries):
-        reply += f"\n\nShowing {len(entries)} of {len(visible_offerings)} current offerings."
-    reply += "\n\nWhich one would you like to know more about?"
     return reply
 
 
@@ -4002,18 +4016,41 @@ def get_offering_lifecycle_status(
         return "Cancelled"
 
     try:
+        def parse_lifecycle_date(value, range_end=False):
+            if value is None or pd.isna(value):
+                return pd.NaT
 
-        start = pd.to_datetime(
-            start_date,
-            errors="coerce"
-        )
+            text = str(value).strip()
+            if not text or text.casefold() in {"nan", "nat", "none"}:
+                return pd.NaT
 
-        end = pd.to_datetime(
-            end_date,
-            errors="coerce"
-        )
+            # A range such as "5-6 December 2026" must use December for
+            # both endpoints. Generic date parsing can read "5-6" as a
+            # month/day and incorrectly mark this future event completed.
+            range_match = re.search(
+                r"(?i)\b(?P<first>\d{1,2})\s*[-–—]\s*"
+                r"(?P<last>\d{1,2})\s+(?P<month>[A-Za-z]+)\s+"
+                r"(?P<year>\d{4})\b",
+                text,
+            )
+            if range_match:
+                day = int(range_match.group("last" if range_end else "first"))
+                month_text = range_match.group("month")
+                year = int(range_match.group("year"))
+                try:
+                    month = datetime.strptime(month_text, "%B").month
+                except ValueError:
+                    month = datetime.strptime(month_text[:3], "%b").month
+                return pd.Timestamp(year=year, month=month, day=day)
 
-        today = pd.Timestamp.now().normalize()
+            return pd.to_datetime(text, errors="coerce", dayfirst=True)
+
+        start = parse_lifecycle_date(start_date)
+        end = parse_lifecycle_date(end_date, range_end=True)
+        if pd.isna(end):
+            end = parse_lifecycle_date(start_date, range_end=True)
+
+        today = pd.Timestamp(datetime.now(IST).date())
 
         if pd.isna(start):
             return "Upcoming"
@@ -4993,6 +5030,31 @@ elif not developer_mode:
 
         record_conversation_message("user", customer_message, lead)
 
+        # Broad catalog questions must be answered from the full CRM list
+        # directly. Do this before intent classification so a model's
+        # retrieval-based summary cannot omit eligible offerings.
+        if is_catalog_listing_question(customer_message):
+            catalog_reply = build_catalog_listing_reply()
+            record_action(
+                "Listed current upcoming and ongoing offerings.",
+                lead=lead,
+                intent="Product Question",
+                sentiment="Neutral",
+                priority="Medium",
+            )
+            update_lead_record(
+                customer_message,
+                "Information Provided",
+                "Listed current offerings",
+                lead.get("Name"),
+                "Medium",
+                "Product Question",
+                "Neutral",
+                target_visitor_id=lead.get("Visitor ID"),
+            )
+            record_conversation_message("assistant", catalog_reply, lead)
+            st.rerun()
+
         if is_greeting_message(customer_message):
             record_conversation_message(
                 "assistant",
@@ -5827,7 +5889,7 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     )
 
     chat_history = dashboard_conversations.copy()
-    chat_columns = ["timestamp", "lead", "visitor_id", "role", "content"]
+    chat_columns = ["timestamp", "lead", "visitor_id", "role", "content", "message_id"]
     for column in chat_columns:
         if column not in chat_history.columns:
             chat_history[column] = ""
@@ -5836,14 +5898,48 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     chat_history["visitor_id"] = chat_history["visitor_id"].astype(str).str.strip()
     chat_history["lead"] = chat_history["lead"].astype(str).str.strip()
     chat_history["content"] = chat_history["content"].astype(str)
-    chat_history["_parsed_timestamp"] = pd.to_datetime(
-        chat_history["timestamp"], errors="coerce", format="mixed"
-    )
-
     def _chat_text(value):
         if value is None or pd.isna(value):
             return ""
         return str(value).strip()
+
+    # Earlier versions appended message values in dict order even when the CSV
+    # already had a different column order. Recognize that shifted-row shape
+    # and restore the original fields for display without discarding messages.
+    valid_chat_roles = {"user", "customer", "human", "assistant"}
+
+    def _is_message_uuid(value):
+        try:
+            uuid.UUID(_chat_text(value))
+            return True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def _is_timestamp(value):
+        return pd.notna(pd.to_datetime(value, errors="coerce", format="mixed"))
+
+    for row_index, row in chat_history.iterrows():
+        if (
+            _is_message_uuid(row.get("lead", ""))
+            and _is_timestamp(row.get("role", ""))
+            and _chat_text(row.get("message_id", "")).casefold() in valid_chat_roles
+        ):
+            shifted = {column: _chat_text(row.get(column, "")) for column in chat_columns}
+            chat_history.at[row_index, "message_id"] = shifted["lead"]
+            chat_history.at[row_index, "timestamp"] = shifted["role"]
+            chat_history.at[row_index, "lead"] = shifted["content"]
+            chat_history.at[row_index, "visitor_id"] = shifted["timestamp"]
+            chat_history.at[row_index, "role"] = shifted["message_id"]
+            chat_history.at[row_index, "content"] = shifted["visitor_id"]
+
+    chat_history = chat_history[["timestamp", "lead", "visitor_id", "role", "content"]]
+    chat_history["timestamp"] = chat_history["timestamp"].astype(str).str.strip()
+    chat_history["visitor_id"] = chat_history["visitor_id"].astype(str).str.strip()
+    chat_history["lead"] = chat_history["lead"].astype(str).str.strip()
+    chat_history["content"] = chat_history["content"].astype(str)
+    chat_history["_parsed_timestamp"] = pd.to_datetime(
+        chat_history["timestamp"], errors="coerce", format="mixed"
+    )
 
     # Resolve names and contact details against the latest CRM lead row. This also
     # renames earlier anonymous messages when a visitor later shares their details.
@@ -5976,28 +6072,62 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
         st.caption(f"{len(chat_sessions)} customer conversation(s)")
         if not chat_sessions:
             st.info("No conversations match that search.")
+
+        # Present the conversations as a compact, sortable CRM table. Selecting
+        # one row opens that customer's complete transcript below the table.
+        chat_rows = []
         for session in chat_sessions:
-            messages = session["messages"]
-            heading = (
-                f"{session['display_name']} · {len(messages)} messages · "
-                f"Last message {session['latest_timestamp']} IST"
+            chat_rows.append(
+                {
+                    "Customer / visitor ID": session["display_name"],
+                    "Visitor ID": session["visitor_id"] or "—",
+                    "Started": session["first_timestamp"],
+                    "Last activity": session["latest_timestamp"],
+                    "Messages": len(session["messages"]),
+                    "Contact": session["email"] or session["phone"] or session["whatsapp"] or "—",
+                }
             )
-            with st.expander(heading, expanded=False):
-                if session["name"]:
-                    st.markdown(f"**Customer:** {session['name']}")
-                if session["visitor_id"]:
-                    st.markdown(f"**Visitor ID:** `{session['visitor_id']}`")
-                if session["email"]:
-                    st.markdown(f"**Email:** {session['email']}")
-                if session["phone"]:
-                    st.markdown(f"**Phone:** {session['phone']}")
-                if session["whatsapp"]:
-                    st.markdown(f"**WhatsApp:** {session['whatsapp']}")
-                st.caption(
-                    f"Started {session['first_timestamp']} IST · "
-                    f"Latest activity {session['latest_timestamp']} IST"
-                )
-                st.divider()
+
+        if chat_sessions:
+            st.caption("Select a row to open the full conversation. Click a column heading to sort.")
+            chat_table = st.dataframe(
+                pd.DataFrame(chat_rows),
+                hide_index=True,
+                width="stretch",
+                height=min(420, 42 + (len(chat_rows) * 36)),
+                on_select="rerun",
+                selection_mode="single-row",
+                key="developer_customer_chat_table",
+                column_config={
+                    "Customer / visitor ID": st.column_config.TextColumn(width="medium"),
+                    "Visitor ID": st.column_config.TextColumn(width="medium"),
+                    "Started": st.column_config.TextColumn(width="medium"),
+                    "Last activity": st.column_config.TextColumn(width="medium"),
+                    "Messages": st.column_config.NumberColumn(width="small"),
+                    "Contact": st.column_config.TextColumn(width="medium"),
+                },
+            )
+            selected_rows = chat_table.selection.rows
+        else:
+            selected_rows = []
+
+        if selected_rows:
+            session = chat_sessions[selected_rows[0]]
+            messages = session["messages"]
+            st.markdown(f"#### Conversation: {session['display_name']}")
+            if session["visitor_id"]:
+                st.caption(f"Visitor ID: {session['visitor_id']}")
+            contact_details = [
+                value for value in (session["email"], session["phone"], session["whatsapp"])
+                if value
+            ]
+            if contact_details:
+                st.caption(" · ".join(contact_details))
+            st.caption(
+                f"Started {session['first_timestamp']} IST · "
+                f"Latest activity {session['latest_timestamp']} IST · {len(messages)} messages"
+            )
+            with st.container(border=True):
                 for _, message in messages.iterrows():
                     role = _chat_text(message.get("role", "")).casefold()
                     speaker = "Customer" if role in {"user", "customer", "human"} else "AI assistant"
@@ -6271,7 +6401,9 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
                         connection.close()
     else:
         st.warning(
-            "CRM database: local CSV storage. Configure DATABASE_URL for persistent CRM storage."
+            "This local app is using its local CSV files, which currently contain the older catalog. "
+            "Recent changes made in the hosted app are stored separately. Add the same DATABASE_URL "
+            "used by Streamlit Cloud to this computer's .env file, then restart the app to load the shared data."
         )
 
     # -----------------------------------------

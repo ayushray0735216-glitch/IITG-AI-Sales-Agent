@@ -192,6 +192,18 @@ def build_grounded_chat_reply(message, conversation, offerings):
     explicit = named_offerings(message, offerings)
     focused = explicit or referenced_offerings(message, conversation, offerings)
     comparison = bool(re.search(r"\b(?:compare|comparison|versus|vs|differences?)\b|which (?:one )?is better", message, re.I))
+    generic_comparison = re.fullmatch(
+        r"(?:(?:please|can you|could you|can you help me|help me) )?"
+        r"(?:compare|comparison)(?: (?:all |the |your |our )*(?:options|offerings|products|services|courses|workshops))?"
+        r"|which (?:one )?is better|how do they compare",
+        re.sub(r"[^\w]+", " ", message.casefold()).strip(),
+    )
+    if comparison and not explicit and not re.search(
+        r"\b(?:these|those|them|both|each)\b", message, re.I,
+    ) and not generic_comparison:
+        # 'Compare Python and Java' is a general question, not a request to
+        # compare whatever products happened to appear in an earlier answer.
+        return None
     query = message
     for row in explicit:
         query = re.sub(re.escape(clean_value(row.get("Offering Name"))), "", query, flags=re.I)

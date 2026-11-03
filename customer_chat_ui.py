@@ -11,7 +11,7 @@ from offering_facts import (
     markdown_text, offering_key, offering_lifecycle, offering_price, offering_times, saved_web_url,
 )
 
-CHAT_UI_VERSION = "2026-11-03-chat-bubble-alignment-v6"
+CHAT_UI_VERSION = "2026-11-03-general-chat-v8"
 
 
 THINKING_INDICATOR_HTML = """
@@ -303,7 +303,8 @@ def render_customer_chat(messages, greeting, offerings=None, can_call=False, que
                     st.caption("Sales assistant")
                     st.write(
                         "Tell me what you’re looking for. I can help you explore "
-                        "offerings, compare options, and check prices or dates."
+                        "offerings, compare options, check prices or dates, "
+                        "and answer general knowledge questions."
                     )
             for offset, message in enumerate(recent_messages):
                 index = first_recent + offset
@@ -333,12 +334,10 @@ def render_customer_chat(messages, greeting, offerings=None, can_call=False, que
                 ):
                     suggested_message = question
 
-        st.write("Type your own question or choose a suggestion. Sharing contact details is optional.")
-
     # At the page level, Streamlit pins this native composer to the bottom.
     # Avoid a second scrolling region or a fixed pixel height on small screens.
     typed_message = st.chat_input(
-        "Your message — ask about offerings, prices, dates, or registration",
+        "Your message — ask about offerings or general knowledge",
         key="customer_chat_composer", submit_mode="disable", width="stretch", height=68,
     )
 

@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.sqlite3*
+*.csv
+.vercel/

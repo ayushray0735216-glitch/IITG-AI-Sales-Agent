@@ -18,3 +18,5 @@ autopilot_queue.sqlite3-wal
 autopilot_queue.sqlite3-shm
 autopilot_worker*.log
 .streamlit/secrets.toml
+integration.sqlite3*
+shared-integration*.sqlite3*

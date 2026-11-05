@@ -49,7 +49,7 @@ st.set_page_config(
 # A script rerun gets a fresh catalog snapshot. Repeated retrieval calls within
 # that same rerun reuse it, without retaining stale facts between chat turns.
 _offering_run_cache = {}
-APP_RELEASE = "2026-11-03-general-chat-v8"
+APP_RELEASE = "2026-11-05-shared-integration-v1"
 print(f"App release: {APP_RELEASE}")
 
 load_dotenv()
@@ -1037,6 +1037,14 @@ def record_conversation_message(
             history_file, mode="a", header=False, index=False
         )
     upsert_crm_rows("conversation_history.csv", [row])
+    from shared_integration import enabled as shared_integration_enabled
+    if shared_integration_enabled() and row["visitor_id"]:
+        try:
+            from integration_chat import save_shared_message
+            save_shared_message(row)
+        except Exception as exc:
+            # The original durable transcript remains available for reconciliation.
+            print(f"Shared chat synchronization pending ({type(exc).__name__})")
 
 
 
@@ -1848,6 +1856,21 @@ def update_lead_record(
             st.session_state["customer_lead"] = (
                 leads.loc[index].to_dict()
             )
+
+            from shared_integration import enabled as shared_integration_enabled
+            if shared_integration_enabled() and target_visitor_id:
+                try:
+                    from shared_integration import get_store
+                    shared_store = get_store()
+                    shared_store.open_session(target_visitor_id)
+                    shared_store.save_insight(target_visitor_id, {
+                        "intent": str(leads.at[index, "Last Intent"] or ""),
+                        "sentiment": str(leads.at[index, "Last Sentiment"] or ""),
+                        "priority": str(leads.at[index, "Priority"] or ""),
+                        "status": str(status or ""),
+                    })
+                except Exception as exc:
+                    print(f"Shared sales insight synchronization pending ({type(exc).__name__})")
 
             return True
 
@@ -3195,6 +3218,15 @@ def save_visitor_contact(
     updated_visitor = leads.loc[mask].iloc[0].to_dict()
     st.session_state["customer_lead"] = updated_visitor
     st.session_state["customer_name"] = saved_name
+    from shared_integration import enabled as shared_integration_enabled
+    if shared_integration_enabled():
+        try:
+            from integration_chat import share_contact_preferences
+            st.session_state["shared_chat_session"] = share_contact_preferences(
+                visitor_id, saved_name, email, phone, whatsapp_number, preferred_methods,
+            )
+        except Exception as exc:
+            print(f"Shared contact synchronization pending ({type(exc).__name__})")
     saved_methods = ", ".join(preferred_methods)
     record_action(
         f"Customer saved contact preferences: {saved_methods}.",
@@ -4661,6 +4693,17 @@ if developer_mode:
 # HEADER
 # -----------------------------
 
+if not developer_mode and st.query_params.get("chat_ref"):
+    from shared_integration import enabled as shared_integration_enabled
+    if shared_integration_enabled():
+        try:
+            from integration_chat import prepare_chat_entry
+            prepare_chat_entry(st.query_params, st.session_state)
+            ensure_anonymous_visitor()
+        except Exception as exc:
+            st.warning("This email link could not be matched. You can still start a chat without sharing contact details.")
+            print(f"Shared chat entry unavailable ({type(exc).__name__})")
+
 if not developer_mode:
     st.title("IITG AI Sales Assistant", text_alignment="center")
     st.caption("Your intelligent sales assistant", text_alignment="center")
@@ -4842,6 +4885,8 @@ elif not developer_mode:
         if customer_name
         else "Welcome! Ask me about any product or service."
     )
+    if st.session_state.get("shared_chat_session", {}).get("association") == "email_link_matched":
+        st.caption("This conversation is associated with the contact record for the email link you opened. You can choose whether to share contact details for further follow-up.")
     anonymous_lead = st.session_state.get("customer_lead")
     if not anonymous_lead:
         anonymous_lead = ensure_anonymous_visitor()
@@ -5557,6 +5602,8 @@ elif not developer_mode:
             st.session_state["customer_lead"] = None
             st.session_state["customer_started"] = False
             st.session_state.pop("visitor_id", None)
+            st.session_state.pop("shared_chat_session", None)
+            st.session_state.pop("pending_customer_message", None)
             st.session_state.pop("registration_contact_prompted", None)
             st.session_state.pop("visitor_contact_saved_notice", None)
             for ui_key in list(st.session_state):
@@ -5707,6 +5754,8 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
 
     st.title("Sales workspace")
     st.caption("Lead management, customer activity and sales insights")
+    from integration_chat import render_integration_panel
+    render_integration_panel()
 
     # Global automation policy; saved in shared CRM settings for all services.
     current_autopilot = load_autopilot_settings()
@@ -5988,6 +6037,24 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
     else:
         dashboard_conversations = pd.DataFrame()
 
+    shared_profiles = {}
+    from shared_integration import enabled as shared_integration_enabled
+    if shared_integration_enabled():
+        try:
+            from integration_chat import shared_history_rows, shared_visitor_profiles
+            shared_profiles = shared_visitor_profiles()
+            central_rows = pd.DataFrame(shared_history_rows())
+            if not central_rows.empty:
+                dashboard_conversations = pd.concat([dashboard_conversations, central_rows], ignore_index=True, sort=False)
+                # Nonempty IDs are unique. Legacy rows without IDs remain distinct.
+                with_id = dashboard_conversations["message_id"].fillna("").astype(str).ne("")
+                dashboard_conversations = pd.concat([
+                    dashboard_conversations[with_id].drop_duplicates("message_id", keep="last"),
+                    dashboard_conversations[~with_id],
+                ], ignore_index=True, sort=False)
+        except Exception as exc:
+            st.warning(f"Shared chat records could not be refreshed ({type(exc).__name__}). Saved local history is shown.")
+
     st.markdown('<span id="customer-chat-history"></span>', unsafe_allow_html=True)
     st.subheader("Customer chat history")
     st.caption(
@@ -6071,6 +6138,22 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
         # Rows without either identity are kept separate rather than merged into
         # one misleading anonymous transcript.
         return f"legacy-message:{message_row.name}"
+
+    for visitor_id, shared_profile in shared_profiles.items():
+        prior_profile = crm_profiles.get(visitor_id)
+        if prior_profile is None:
+            crm_profiles[visitor_id] = shared_profile
+        else:
+            merged_profile = dict(prior_profile)
+            for column, value in shared_profile.items():
+                existing_value = _chat_text(merged_profile.get(column, ""))
+                if column in {"Name", "Contact Name", "Email", "Phone", "WhatsApp Number"} and str(merged_profile.get("Contact Consent", "")).casefold() == "yes" and existing_value and not existing_value.casefold().startswith("anonymous visitor"):
+                    # Never replace details actually supplied by the visitor
+                    # with an unverified email-recipient association.
+                    continue
+                if value:
+                    merged_profile[column] = value
+            crm_profiles[visitor_id] = merged_profile
 
     if not chat_history.empty:
         chat_history["_group_key"] = chat_history.apply(_customer_chat_group_key, axis=1)
@@ -6156,6 +6239,8 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
                     "phone": profile_phone,
                     "whatsapp": profile_whatsapp,
                     "display_name": display_name,
+                    "association": _chat_text(profile.get("Identity association", "")) if profile is not None else "",
+                    "contact_id": _chat_text(profile.get("Contact ID", "")) if profile is not None else "",
                     "first_timestamp": first_timestamp,
                     "latest_timestamp": latest_timestamp,
                 }
@@ -6192,6 +6277,7 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
                     "Last activity": session["latest_timestamp"],
                     "Messages": len(session["messages"]),
                     "Contact": session["email"] or session["phone"] or session["whatsapp"] or "—",
+                    "Identity match": session["association"].replace("_", " ") or "Visitor details",
                 }
             )
 
@@ -6224,6 +6310,8 @@ if developer_mode and st.session_state.get("developer_authenticated", False):
             st.markdown(f"#### Conversation: {session['display_name']}")
             if session["visitor_id"]:
                 st.caption(f"Visitor ID: {session['visitor_id']}")
+            if session["contact_id"]:
+                st.caption(f"Shared contact: {session['contact_id']} · {session['association'].replace('_', ' ')} (not a verified login)")
             contact_details = [
                 value for value in (session["email"], session["phone"], session["whatsapp"])
                 if value

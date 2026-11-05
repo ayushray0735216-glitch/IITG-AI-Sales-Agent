@@ -349,6 +349,10 @@ def sync_csv_to_database(
                 list(values.items()), page_size=500,
             )
 
+        if filename == "offerings.csv":
+            from shared_integration import publish_crm_change
+            publish_crm_change(conn, "catalog.updated", "offerings")
+
         conn.commit()
 
     finally:
@@ -440,6 +444,8 @@ def save_offerings_data(offerings: pd.DataFrame) -> None:
                     """,
                     (_offering_key(data), Json(data)),
                 )
+        from shared_integration import publish_crm_change
+        publish_crm_change(conn, "catalog.updated", "offerings")
         conn.commit()
     finally:
         conn.close()
@@ -556,6 +562,8 @@ def save_autopilot_settings(settings: dict) -> dict:
                     """,
                     ("autopilot", Json(saved)),
                 )
+            from shared_integration import publish_crm_change
+            publish_crm_change(conn, "policy.updated", "autopilot")
             conn.commit()
         finally:
             conn.close()

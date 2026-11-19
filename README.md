@@ -17,6 +17,48 @@ The system combines:
 - CSV-based lead management
 - Gmail SMTP for automated email actions
 
+## Autopilot background scanner
+
+The follow-up eligibility scan runs in a separate process every five minutes. It writes proposed actions to the
+persistent queue; it does not send emails or place calls. Staff review and the existing consent, channel, quiet-hour,
+attempt, and cooldown rules still apply.
+
+The same worker also runs enabled **Find prospects** searches at the saved daily or weekly time (IST). It saves
+masked, scored candidates in a per-search review queue. Scheduled discovery never reveals an email, imports a lead,
+or contacts anyone. In Find prospects, select a saved search, open **Automatic search settings**, enable the schedule,
+and then use **Run discovery now** for an immediate check. Move suitable matches to the review list before importing
+them into Leads. The worker needs `HUNTER_API_KEY` in its environment. If it is stopped, the page shows a warning.
+
+Hunter's free company discovery covers at most its first 100 matching companies. The company headquarters location
+is used for regional targeting, not the person's own location. Hunter can filter US states by two-letter code and
+cities with a country; a non-US state by itself cannot be applied and will produce a clear error. Use a city instead.
+Industry names must be Hunter's valid labels. The fit score records only observable role and company signals;
+customer interest is recorded after an actual reply or chat. Staff approvals and rejections can suggest a better
+minimum fit score, but do not silently change it. Results are deduplicated and the automatic queue is
+bounded. Hunter's search endpoints used here do not spend reveal credits; revealing an email still requires review.
+
+### Local setup
+
+Run the Streamlit app as usual, then start a second terminal in this project folder and run:
+
+```text
+python autopilot_worker.py
+```
+
+Without `DATABASE_URL`, the local queue is stored in SQLite and lead/activity records are read from CSV. The app and
+worker must use the same `CRM_DATA_DIR` (the project folder by default).
+
+### Hosted setup
+
+Create a separate background worker for this repository with start command `python autopilot_worker.py`. Give it the
+same `DATABASE_URL` and CRM-related environment variables as the web service so both processes use the same
+PostgreSQL database. The worker records its heartbeat in CRM settings; the Autopilot panel warns when that heartbeat
+is missing, overdue, or reports an error. Do not use the local SQLite fallback across separate hosted services.
+
+The PostgreSQL action table enforces unique task IDs, and claims use database row locks. Local SQLite uses a primary
+key plus transactional claims. Together these prevent duplicate queue rows and duplicate task claims across process
+restarts. Interrupted work is left visible for staff review rather than silently retried.
+
 ## Core Capabilities
 
 ### 1. AI Customer Analysis

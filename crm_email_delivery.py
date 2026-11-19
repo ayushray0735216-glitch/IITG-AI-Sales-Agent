@@ -23,8 +23,8 @@ def email_markdown_to_html(body):
         escaped = re.sub(
             r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
             lambda match: (
-                f'<a href="{html.escape(match.group(2), quote=True)}">{match.group(1)}</a>'
-                if urlparse(match.group(2)).scheme in {"http", "https"}
+                f'<a href="{html.escape(html.unescape(match.group(2)), quote=True)}">{match.group(1)}</a>'
+                if urlparse(html.unescape(match.group(2))).scheme in {"http", "https"}
                 else match.group(1)
             ),
             escaped,

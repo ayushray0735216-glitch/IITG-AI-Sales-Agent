@@ -22,7 +22,7 @@ def filter_conversation_history(history: pd.DataFrame, lead) -> pd.DataFrame:
 
     if visitor_id and "visitor_id" in history.columns:
         matches |= history["visitor_id"].map(_text).eq(visitor_id)
-    if name and "lead" in history.columns:
+    if name and "lead" in history.columns and not _text(lead.get("Lead Import Key")):
         matches |= history["lead"].map(_text).str.casefold().eq(name.casefold())
 
     result = history.loc[matches].copy()
@@ -52,9 +52,14 @@ def build_activity_timeline(
 
     if activity is not None and not activity.empty and "lead" in activity.columns:
         name = _text(lead.get("Name", ""))
-        selected = activity.loc[
-            activity["lead"].map(_text).str.casefold().eq(name.casefold())
-        ]
+        import_key = _text(lead.get("Lead Import Key"))
+        activity_keys = activity.get("lead_import_key", pd.Series("", index=activity.index)).map(_text)
+        if import_key:
+            selected = activity.loc[activity_keys.eq(import_key)]
+        else:
+            selected = activity.loc[
+                activity_keys.eq("") & activity["lead"].map(_text).str.casefold().eq(name.casefold())
+            ]
         for _, row in selected.iterrows():
             details = _text(row.get("action", "Sales activity"))
             context = [

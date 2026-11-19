@@ -49,7 +49,7 @@ def build_crm_overview(leads: pd.DataFrame, today: date | None = None) -> dict:
         lambda value: value is not None and value <= today
     )
 
-    file_based = ~walk_in
+    file_based = ~walk_in | column("Workbook Profile").ne("")
 
     masks = {
         "new": new_lead,

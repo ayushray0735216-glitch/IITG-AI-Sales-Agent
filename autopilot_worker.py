@@ -90,6 +90,7 @@ def scan_queue_once(settings: dict | None = None, now: datetime | None = None) -
 
     heartbeat = {
         "status": "running",
+        "prospect_discovery": True,
         "storage_mode": storage_mode,
         "enabled": bool(policy.get("enabled", False)),
         "checked_at": now.isoformat(),
@@ -130,9 +131,14 @@ def run_forever() -> None:
             "DATABASE_URL is not configured. Local mode uses a SQLite queue and CSV CRM data; "
             "the web app and worker must share the same CRM_DATA_DIR. Hosted services need shared PostgreSQL."
         )
+    from bulk_email import start_sender
+    from prospect_discovery import scan_due_profiles
+    from registration_workflow import send_due_reminders
+
     interval = _interval_seconds()
     LOGGER.info("Autopilot background scanner started; interval=%s seconds", interval)
     while not STOP_EVENT.is_set():
+        start_sender()
         try:
             status = scan_queue_once()
             LOGGER.info(
@@ -144,6 +150,20 @@ def run_forever() -> None:
         except Exception as error:
             LOGGER.exception("Autopilot scan failed")
             _record_failure(error)
+        try:
+            for outcome in scan_due_profiles():
+                if outcome["error"]:
+                    LOGGER.warning("Prospect search %s: %s", outcome["search"], outcome["error"])
+                else:
+                    LOGGER.info("Prospect search %s: %s new matches", outcome["search"], outcome["added"])
+        except Exception:
+            LOGGER.exception("Scheduled prospect discovery failed")
+        try:
+            sent_reminders = send_due_reminders()
+            if sent_reminders:
+                LOGGER.info("Sent %s opted-in event reminder(s)", sent_reminders)
+        except Exception:
+            LOGGER.exception("Scheduled event reminder check failed")
         STOP_EVENT.wait(interval)
     LOGGER.info("Autopilot background scanner stopped")
 

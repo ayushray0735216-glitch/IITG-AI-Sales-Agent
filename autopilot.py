@@ -151,6 +151,9 @@ def contact_action_block_reason(
     if not _has_method(methods, channel):
         return f"The customer has not selected {channel} as an approved contact method."
     if channel == "email":
+        consent_address = _text(lead.get("Email Consent Address", ""))
+        if consent_address and consent_address.casefold() != destination.casefold():
+            return "Recorded email permission is for a different address."
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", destination):
             return "The email address is missing or invalid."
         if _text(lead.get("Email", "")).casefold() != destination.casefold():

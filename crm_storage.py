@@ -5,13 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import Lock
+from time import monotonic
+from uuid import uuid4
 
 import pandas as pd
 import psycopg2
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE, connection as PostgreSQLConnection
 from psycopg2.extras import Json, execute_values
 
 
@@ -21,6 +28,13 @@ DATA_DIR = Path(
 ).expanduser()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+_lead_write_lock = Lock()
+_connection_lock = Lock()
+_idle_connections = []
+_CONNECTION_IDLE_SECONDS = 30
+_MAX_IDLE_CONNECTIONS = 4
+LEAD_EDIT_FIELDS = ("Name", "Email", "Phone", "WhatsApp Number", "Company", "Job Role", "Status", "Priority")
+LEAD_PHONE_DTYPES = {"Phone": str, "WhatsApp Number": str}
 
 
 def crm_path(filename: str) -> str:
@@ -56,8 +70,60 @@ def get_connection():
     if not DATABASE_URL:
         return None
 
-    return psycopg2.connect(DATABASE_URL, connect_timeout=8)
+    # A sleeping Neon compute or a brief DNS failure can make the first
+    # connection fail. Retry only connection failures; never switch storage.
+    for attempt in range(3):
+        try:
+            return psycopg2.connect(DATABASE_URL, connect_timeout=6)
+        except psycopg2.OperationalError:
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
 
+
+def connection_failure_message(error: Exception) -> str:
+    """Give a useful, credential-free explanation for a failed connection."""
+    detail = str(error).casefold()
+    if "could not translate host name" in detail or "name or service not known" in detail:
+        return ("The CRM server address could not be found. Check your internet connection and "
+                "DNS, then confirm the DATABASE_URL host in Neon is still current.")
+    if "password authentication failed" in detail or "authentication failed" in detail:
+        return "The CRM rejected its login details. Copy a fresh connection string from Neon into .env and restart Sharngon."
+    if "timeout" in detail or "could not connect to server" in detail or "connection refused" in detail:
+        return "The CRM server did not respond. Check the internet connection and Neon project status, then retry."
+    return "The CRM connection failed. Check the Neon project and connection string, then retry."
+
+
+
+def _borrow_connection():
+    """Reuse a recently returned connection without sharing a live transaction."""
+    now = monotonic()
+    with _connection_lock:
+        while _idle_connections:
+            returned_at, dsn, conn = _idle_connections.pop()
+            if dsn == DATABASE_URL and not conn.closed and now - returned_at < _CONNECTION_IDLE_SECONDS:
+                return conn
+            conn.close()
+    return get_connection()
+
+
+def _release_connection(conn):
+    """Roll back unfinished work before retaining an idle database connection."""
+    # Tests and external callers can supply their own connection implementation.
+    if not isinstance(conn, PostgreSQLConnection):
+        conn.close()
+        return
+    try:
+        if not conn.closed and conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
+            conn.rollback()
+    except psycopg2.Error:
+        conn.close()
+        return
+    with _connection_lock:
+        if not conn.closed and len(_idle_connections) < _MAX_IDLE_CONNECTIONS:
+            _idle_connections.append((monotonic(), DATABASE_URL, conn))
+            return
+    conn.close()
 
 def upsert_crm_rows(filename: str, rows: list[dict]) -> None:
     """Persist just changed rows; callers keep the local CSV copy."""
@@ -70,7 +136,7 @@ def upsert_crm_rows(filename: str, rows: list[dict]) -> None:
         # Match blank-cell normalization used by the existing CSV sync path.
         data = {str(key): None if pd.isna(value) or value == "" else value for key, value in row.items()}
         values[_row_key(filename, data)] = Json(data)
-    conn = get_connection()
+    conn = _borrow_connection()
     try:
         with conn.cursor() as cur:
             execute_values(
@@ -81,7 +147,7 @@ def upsert_crm_rows(filename: str, rows: list[dict]) -> None:
             )
         conn.commit()
     finally:
-        conn.close()
+        _release_connection(conn)
 
 
 def initialize_database() -> None:
@@ -89,7 +155,7 @@ def initialize_database() -> None:
     if not database_enabled():
         return
 
-    conn = get_connection()
+    conn = _borrow_connection()
 
     try:
         with conn.cursor() as cur:
@@ -98,137 +164,471 @@ def initialize_database() -> None:
                 CREATE TABLE IF NOT EXISTS crm_leads (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS sales_activity (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS conversation_history (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS email_inbox (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS crm_offerings (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS crm_settings (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
+                );
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS crm_automation_actions (
                     row_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
+                );
+
                 CREATE TABLE IF NOT EXISTS crm_communication_events (
                     event_id TEXT PRIMARY KEY,
                     provider_id TEXT,
                     data JSONB NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
+                );
+
                 CREATE INDEX IF NOT EXISTS crm_communication_events_provider_idx
-                ON crm_communication_events (provider_id)
-                """
-            )
-            cur.execute(
-                """
+                    ON crm_communication_events (provider_id);
+
                 CREATE TABLE IF NOT EXISTS crm_contact_suppressions (
                     suppression_key TEXT PRIMARY KEY,
                     data JSONB NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
+                );
+
                 CREATE INDEX IF NOT EXISTS crm_automation_actions_status_idx
-                ON crm_automation_actions ((lower(data ->> 'status')))
-                """
-            )
-            cur.execute(
-                """
+                    ON crm_automation_actions ((lower(data ->> 'status')));
+
                 CREATE INDEX IF NOT EXISTS crm_automation_actions_lead_idx
-                ON crm_automation_actions ((data ->> 'lead_key'))
+                    ON crm_automation_actions ((data ->> 'lead_key'));
                 """
             )
 
         conn.commit()
 
-        # Seed empty tables from bundled/local CSV files.
-        sync_csv_to_database("leads.csv", only_if_empty=True)
-        sync_csv_to_database(
-            "sales_activity.csv",
-            only_if_empty=True,
-        )
-        sync_csv_to_database(
-            "conversation_history.csv",
-            only_if_empty=True,
-        )
-        sync_csv_to_database("email_inbox.csv", only_if_empty=True)
-        sync_csv_to_database("offerings.csv", only_if_empty=True)
-
-        # Once PostgreSQL contains data, recreate the local CSV cache.
-        sync_database_to_csv("leads.csv")
-        sync_database_to_csv("sales_activity.csv")
-        sync_database_to_csv("conversation_history.csv")
-        sync_database_to_csv("email_inbox.csv")
-        sync_database_to_csv("offerings.csv")
-
     finally:
-        conn.close()
+        _release_connection(conn)
+
+    for filename in (
+        "leads.csv", "sales_activity.csv", "conversation_history.csv",
+        "email_inbox.csv", "offerings.csv",
+    ):
+        sync_csv_to_database(filename, only_if_empty=True)
+        sync_database_to_csv(filename)
+
+
+def lead_cell(value) -> str:
+    return "" if value is None or pd.isna(value) else str(value).strip()
 
 
 def _lead_key(row: dict) -> str:
-    email = row.get("Email")
+    record_id = lead_cell(row.get("CRM Record ID"))
+    if record_id:
+        return "lead:" + record_id
 
-    if email is not None and str(email).strip():
-        return "email:" + str(email).strip().casefold()
+    import_key = row.get("Lead Import Key")
+    if isinstance(import_key, str) and import_key.startswith("import:"):
+        return import_key
 
-    name = row.get("Name")
+    email = lead_cell(row.get("Email"))
+    if email:
+        return "email:" + email.casefold()
 
-    if name is not None and str(name).strip():
-        return "name:" + str(name).strip().casefold()
+    name = lead_cell(row.get("Name"))
+    if name:
+        return "name:" + name.casefold()
 
     return _generic_key(row)
+
+
+
+def lead_identity(row):
+    """Identify a lead across review and delivery."""
+    visitor_id = lead_cell(row.get("Visitor ID"))
+    return "visitor:" + visitor_id if visitor_id else _lead_key(row)
+
+
+def save_recorded_email_consent(original, source, recorded_on):
+    """Record staff-confirmed email permission for the current lead address."""
+    identity = lead_identity(original)
+    address = lead_cell(original.get("Email"))
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) or not source.strip():
+        raise ValueError("A valid email address and the source of consent are required.")
+    if is_contact_suppressed(address, "email"):
+        raise ValueError("This address has an active email suppression.")
+
+    def apply_changes(current):
+        matches = [
+            key for key, row in current.items()
+            if lead_identity(row) == identity and lead_cell(row.get("Email")).casefold() == address.casefold()
+        ]
+        if len(matches) != 1:
+            return False, {}
+        key = matches[0]
+        row = current[key]
+        if lead_cell(row.get("Status")).casefold() == "unsubscribed":
+            raise ValueError("This lead is marked as unsubscribed.")
+        methods = [item.strip() for item in lead_cell(row.get("Preferred Contact Methods")).split(",") if item.strip()]
+        if not any(method.casefold() == "email" for method in methods):
+            methods.append("Email")
+        updated = {
+            **row, "Contact Consent": "Yes", "Preferred Contact Methods": ", ".join(methods),
+            "Email Consent Source": source.strip(), "Email Consent Date": recorded_on,
+            "Email Consent Address": address,
+        }
+        current[key] = updated
+        return True, {key: updated}
+
+    return _write_leads(apply_changes)
+
+def _merge_workbook_leads(current, incoming):
+    """Keep existing CRM values and attach the latest nonblank workbook fields."""
+    by_import_key = {}
+    by_email = {}
+    for key, lead in current.items():
+        for field in ("Lead Import Key", "Workbook Match Key"):
+            if lead.get(field):
+                by_import_key.setdefault(lead[field], key)
+        if lead.get("Email"):
+            by_email.setdefault(str(lead["Email"]).strip().casefold(), key)
+
+    counts = dict(added=0, updated=0, unchanged=0, conflicts=0)
+    changed = {}
+    for lead in incoming:
+        import_key = lead["Lead Import Key"]
+        email = lead["Email"].casefold()
+        key_match = by_import_key.get(import_key)
+        email_match = by_email.get(email) if email else None
+        if email_match is not None:
+            email_record = current[email_match]
+            email_key = email_record.get("Workbook Match Key") or email_record.get("Lead Import Key") or ""
+            conflicting_linkedin = (
+                email_key.startswith("import:linkedin:") and import_key.startswith("import:linkedin:")
+                and email_key != import_key
+            )
+            if conflicting_linkedin or (key_match is not None and key_match != email_match):
+                counts["conflicts"] += 1
+                continue
+
+        key = key_match if key_match is not None else email_match
+        profile = json.loads(lead["Workbook Profile"])
+        if key is None:
+            key = import_key
+            merged = {**lead, "Status": "New", "Lead Source": "Lead File", "Contact Consent": "No"}
+            counts["added"] += 1
+        else:
+            existing = current[key]
+            merged = existing.copy()
+            stored_identity = existing.get("Workbook Match Key") or existing.get("Lead Import Key")
+            if import_key != stored_identity and (
+                import_key.startswith("import:linkedin:") or not stored_identity
+            ):
+                merged["Workbook Match Key"] = import_key
+
+            for field, value in lead.items():
+                if field not in {"Lead Import Key", "Workbook Profile"} and value:
+                    if not str(merged.get(field) or "").strip():
+                        merged[field] = value
+
+            stored = workbook_profile(existing.get("Workbook Profile"))
+            for field, value in profile.items():
+                if value or field not in stored:
+                    stored[field] = value
+            merged["Workbook Profile"] = json.dumps(stored, ensure_ascii=False)
+            if merged == existing:
+                counts["unchanged"] += 1
+            else:
+                counts["updated"] += 1
+
+        if current.get(key) != merged:
+            current[key] = changed[key] = merged
+        by_import_key[import_key] = key
+        if merged.get("Email"):
+            by_email[str(merged["Email"]).strip().casefold()] = key
+    return counts, changed
+
+
+def workbook_profile(payload):
+    if not isinstance(payload, str) or not payload:
+        return {}
+    try:
+        fields = json.loads(payload)
+    except ValueError:
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def _replace_leads_csv(destination, records):
+    with NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=destination.parent,
+                            suffix=".tmp", delete=False) as output:
+        staged = Path(output.name)
+        try:
+            pd.DataFrame(records).to_csv(output, index=False)
+            output.close()
+            staged.replace(destination)
+        finally:
+            output.close()
+            staged.unlink(missing_ok=True)
+
+
+def _write_leads(apply_changes):
+    """Apply a batch against the current CRM and rebuild the local lead cache."""
+    with _lead_write_lock:
+        destination = Path(ensure_seed_file("leads.csv"))
+        if not database_enabled():
+            records = (
+                pd.read_csv(destination, dtype=str, keep_default_na=False).to_dict("records")
+                if destination.exists() else []
+            )
+            # Positional keys retain all legacy CSV rows, even if names repeat.
+            current = dict(enumerate(records))
+            result, changed = apply_changes(current)
+            if changed:
+                _replace_leads_csv(destination, list(current.values()))
+            return result, True
+
+        conn = _borrow_connection()
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("LOCK TABLE crm_leads IN SHARE ROW EXCLUSIVE MODE")
+                    cursor.execute("SELECT row_key, data FROM crm_leads ORDER BY row_key")
+                    current = dict(cursor.fetchall())
+                    result, changed = apply_changes(current)
+                    if changed:
+                        execute_values(
+                            cursor,
+                            "INSERT INTO crm_leads (row_key, data) VALUES %s "
+                            "ON CONFLICT (row_key) DO UPDATE SET data = EXCLUDED.data",
+                            [(key, Json(current[key])) for key in changed if key in current],
+                        )
+                        removed = [key for key in changed if key not in current]
+                        if removed:
+                            cursor.execute("DELETE FROM crm_leads WHERE row_key = ANY(%s)", (removed,))
+        finally:
+            _release_connection(conn)
+
+        try:
+            _replace_leads_csv(destination, list(current.values()))
+        except OSError:
+            return result, False
+        return result, True
+
+
+def import_workbook_leads(incoming):
+    """Merge an uploaded workbook into the active CRM and refresh its local cache."""
+    return _write_leads(lambda current: _merge_workbook_leads(current, incoming))
+
+
+def import_hunter_prospects(prospects):
+    """Save reviewed Hunter contacts, reusing unambiguous CRM records atomically."""
+    if not prospects or len(prospects) > 50:
+        raise ValueError("Choose between 1 and 50 reviewed prospects to import.")
+    prepared = []
+    seen_handles = set()
+    for prospect in prospects:
+        handle = str(prospect.get("handle") or "").strip()
+        name = str(prospect.get("name") or "").strip()
+        company = str(prospect.get("company") or "").strip()
+        email = str(prospect.get("email") or "").strip().casefold()
+        if not handle or handle in seen_handles or not name or not company:
+            raise ValueError("Each selected prospect needs a unique Hunter result, name, and company.")
+        if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise ValueError("A revealed prospect email is invalid.")
+        experience = str(prospect.get("experience") or "").strip()
+        if experience:
+            try:
+                years = float(experience)
+            except ValueError:
+                raise ValueError("Experience must be a number of years or left blank.") from None
+            if not 0 <= years <= 80:
+                raise ValueError("Experience must be between 0 and 80 years.")
+        seen_handles.add(handle)
+        prepared.append({
+            "hunter_key": "import:hunter:" + hashlib.sha256(handle.encode("utf-8")).hexdigest(),
+            "name": name, "company": company,
+            "title": str(prospect.get("title") or "").strip(),
+            "domain": str(prospect.get("domain") or "").strip(),
+            "email": email, "phone": str(prospect.get("phone") or "").strip(),
+            "linkedin": str(prospect.get("linkedin") or "").strip(),
+            "experience": experience,
+            "verification": str(prospect.get("verification") or "").strip(),
+            "name_status": str(prospect.get("name_status") or "Hunter masked").strip(),
+        })
+
+    def apply_changes(current):
+        result = {"added": 0, "updated": 0, "already_present": 0, "needs_review": 0,
+                  "details": [], "lead_keys": [], "stored": []}
+        changed = {}
+        for item in prepared:
+            email = item["email"]
+            name = item["name"].casefold()
+            company = item["company"].casefold()
+            key_matches = [key for key, row in current.items()
+                           if lead_cell(row.get("Hunter Prospect Key")) == item["hunter_key"]
+                           or lead_cell(row.get("Lead Import Key")) == item["hunter_key"]]
+            email_matches = [key for key, row in current.items()
+                             if email and lead_cell(row.get("Email")).casefold() == email]
+            exact_matches = [key for key, row in current.items()
+                             if lead_cell(row.get("Name")).casefold() == name
+                             and lead_cell(row.get("Company")).casefold() == company]
+            matches = set(key_matches + email_matches + exact_matches)
+            masked = item["name_status"].casefold() == "hunter masked"
+            possible_matches = [key for key, row in current.items()
+                                if masked and not matches
+                                and lead_cell(row.get("Company")).casefold() == company
+                                and lead_cell(row.get("Name")).casefold().startswith(name.rstrip(".")[:1])
+                                and lead_cell(row.get("Name")).split(" ")[0].casefold()
+                                == item["name"].split(" ")[0].casefold()]
+            if len(matches) > 1 or possible_matches:
+                result["needs_review"] += 1
+                result["details"].append(f"{item['name']} · {item['company']}: possible existing lead; review manually.")
+                continue
+            key = next(iter(matches)) if matches else None
+            existing = current[key] if key is not None else {}
+            if key is not None and email and lead_cell(existing.get("Email")) not in ("", email):
+                result["needs_review"] += 1
+                result["details"].append(f"{item['name']} · {item['company']}: existing lead has another email.")
+                continue
+            profile = workbook_profile(existing.get("Workbook Profile"))
+            profile.update({
+                "Hunter Domain": item["domain"],
+                "Hunter Verification": item["verification"],
+                "Hunter Name Status": item["name_status"],
+            })
+            for field, value in (("Name", item["name"]), ("Job Title", item["title"]),
+                                 ("Company", item["company"]), ("Website", item["domain"])):
+                if value and not profile.get(field):
+                    profile[field] = value
+            if item["linkedin"]:
+                profile.setdefault("LinkedIn", item["linkedin"])
+            if item["experience"] and not profile.get("Experience (Years)"):
+                profile["Experience (Years)"] = item["experience"]
+            if not profile.get("Experience (Years)"):
+                profile["Experience (Years)"] = ""
+            if item["email"] and not profile.get("Email"):
+                profile["Email"] = item["email"]
+            if key is None:
+                record_id = uuid4().hex
+                row = {
+                    "CRM Record ID": record_id, "Lead Import Key": item["hunter_key"],
+                    "Hunter Prospect Key": item["hunter_key"],
+                    "Name": item["name"], "Email": item["email"],
+                    "Phone": item["phone"], "Company": item["company"],
+                    "Job Role": item["title"], "Status": "New",
+                    "Lead Source": "Hunter Prospect", "Contact Consent": "No",
+                    "Workbook Profile": json.dumps(profile, ensure_ascii=False),
+                }
+                key = (max(current, default=-1) + 1 if not database_enabled()
+                       else _lead_key(row))
+                current[key] = changed[key] = row
+                result["added"] += 1
+            else:
+                row = existing.copy()
+                for field, value in (("Email", item["email"]), ("Phone", item["phone"]),
+                                     ("Job Role", item["title"]), ("Company", item["company"])):
+                    if value and not lead_cell(row.get(field)):
+                        row[field] = value
+                if key_matches and not masked and item["name_status"] in {"Hunter revealed", "Staff supplied"}:
+                    row["Name"] = item["name"]
+                    profile["Name"] = item["name"]
+                row["Hunter Prospect Key"] = item["hunter_key"]
+                row["Workbook Profile"] = json.dumps(profile, ensure_ascii=False)
+                if row != existing:
+                    if _lead_key(row) != _lead_key(existing):
+                        row["CRM Record ID"] = uuid4().hex
+                        if isinstance(key, str):
+                            del current[key]
+                            changed[key] = None
+                            key = _lead_key(row)
+                    current[key] = changed[key] = row
+                    result["updated"] += 1
+                else:
+                    result["already_present"] += 1
+            result["lead_keys"].append(_lead_key(current[key]))
+            result["stored"].append(item["hunter_key"])
+        return result, changed
+
+    return _write_leads(apply_changes)
+
+
+def save_lead_edits(edits):
+    """Validate and save a batch of edits using the original values to detect conflicts."""
+    def apply_changes(current):
+        positions = {}
+        for key, row in current.items():
+            # PostgreSQL already provides the canonical row key. CSV rows use positions.
+            identity = key if isinstance(key, str) else _lead_key(row)
+            positions.setdefault(identity, []).append(key)
+
+        changed = {}
+        updated_count = 0
+        changed_emails = set()
+        for original, edits_for_row in edits:
+            matches = positions.get(_lead_key(original), [])
+            if len(matches) != 1 or matches[0] in changed:
+                raise ValueError("A lead could not be identified uniquely. Refresh the lead records and try again.")
+            key = matches[0]
+            row = current[key]
+            updates = {}
+            for field, raw_value in edits_for_row.items():
+                if field not in LEAD_EDIT_FIELDS:
+                    raise ValueError("This column cannot be edited.")
+                value = lead_cell(raw_value)
+                existing = lead_cell(row.get(field))
+                if value == existing:
+                    continue
+                if existing != lead_cell(original.get(field)):
+                    raise ValueError("A lead changed while you were editing. Refresh the lead records and try again.")
+                if field == "Name" and not value:
+                    raise ValueError("Enter a name for each lead.")
+                if field == "Email" and value:
+                    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+                        raise ValueError("Enter a valid email address or clear the email cell.")
+                    if value.casefold() != existing.casefold():
+                        changed_emails.add(value.casefold())
+                if field in LEAD_PHONE_DTYPES and value:
+                    digits = re.sub(r"[^0-9]", "", value)
+                    if not re.fullmatch(r"\+?[0-9(). -]+", value) or not 7 <= len(digits) <= 15:
+                        raise ValueError("Enter a phone or WhatsApp number with 7 to 15 digits, or clear the cell.")
+                updates[field] = value
+            if not updates:
+                continue
+
+            updated = {**row, **updates}
+            if _lead_key(updated) != _lead_key(row):
+                # Move a legacy email/name keyed row once, then keep its identity stable.
+                updated["CRM Record ID"] = uuid4().hex
+                if isinstance(key, str):
+                    del current[key]
+                    changed[key] = None
+                    key = _lead_key(updated)
+            current[key] = changed[key] = updated
+            updated_count += 1
+
+        seen_emails = set()
+        for row in current.values():
+            email = lead_cell(row.get("Email")).casefold()
+            if email in changed_emails and email in seen_emails:
+                raise ValueError("That email address is already assigned to another lead.")
+            seen_emails.add(email)
+        return updated_count, changed
+
+    return _write_leads(apply_changes)
 
 
 def _generic_key(row: dict) -> str:
@@ -308,13 +708,13 @@ def sync_csv_to_database(
     if not path.exists():
         return
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype=LEAD_PHONE_DTYPES if filename == "leads.csv" else None)
 
     if df.empty:
         return
 
     table = _table_name(filename)
-    conn = get_connection()
+    conn = _borrow_connection()
 
     try:
         with conn.cursor() as cur:
@@ -356,7 +756,7 @@ def sync_csv_to_database(
         conn.commit()
 
     finally:
-        conn.close()
+        _release_connection(conn)
 
 
 def sync_database_to_csv(filename: str) -> None:
@@ -365,7 +765,7 @@ def sync_database_to_csv(filename: str) -> None:
         return
 
     table = _table_name(filename)
-    conn = get_connection()
+    conn = _borrow_connection()
 
     try:
         with conn.cursor() as cur:
@@ -384,7 +784,7 @@ def sync_database_to_csv(filename: str) -> None:
         )
 
     finally:
-        conn.close()
+        _release_connection(conn)
 
 
 def sync_after_csv_write(filename: str) -> None:
@@ -398,7 +798,7 @@ def sync_after_csv_write(filename: str) -> None:
 def load_offerings_data() -> pd.DataFrame:
     """Read the latest offerings catalog from shared storage, or CSV fallback."""
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM crm_offerings ORDER BY row_key")
@@ -407,7 +807,7 @@ def load_offerings_data() -> pd.DataFrame:
             # offering was removed or deactivated. Never revive an old local cache.
             return pd.DataFrame(rows)
         finally:
-            conn.close()
+            _release_connection(conn)
 
     path = Path(crm_path("offerings.csv"))
     if path.exists():
@@ -426,7 +826,7 @@ def save_offerings_data(offerings: pd.DataFrame) -> None:
     if not database_enabled():
         return
 
-    conn = get_connection()
+    conn = _borrow_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM crm_offerings")
@@ -448,7 +848,7 @@ def save_offerings_data(offerings: pd.DataFrame) -> None:
         publish_crm_change(conn, "catalog.updated", "offerings")
         conn.commit()
     finally:
-        conn.close()
+        _release_connection(conn)
 
 
 AUTOPILOT_DEFAULTS = {
@@ -468,7 +868,7 @@ def load_autopilot_settings() -> dict:
     """Load the shared autopilot policy, falling back to local JSON storage."""
     data = None
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM crm_settings WHERE row_key = %s", ("autopilot",))
@@ -476,7 +876,7 @@ def load_autopilot_settings() -> dict:
             if row:
                 data = row[0]
         finally:
-            conn.close()
+            _release_connection(conn)
     else:
         settings_path = Path(crm_path("autopilot_settings.json"))
         if settings_path.exists():
@@ -550,7 +950,7 @@ def save_autopilot_settings(settings: dict) -> dict:
     saved = _normalize_autopilot_settings(settings)
 
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -566,7 +966,7 @@ def save_autopilot_settings(settings: dict) -> dict:
             publish_crm_change(conn, "policy.updated", "autopilot")
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
     else:
         settings_path = Path(crm_path("autopilot_settings.json"))
         with settings_path.open("w", encoding="utf-8") as settings_file:
@@ -670,18 +1070,18 @@ def load_crm_table(filename: str) -> pd.DataFrame:
     if filename not in tables:
         raise ValueError("Only leads.csv and sales_activity.csv can be loaded by the worker.")
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT data FROM {tables[filename]} ORDER BY row_key")
                 return pd.DataFrame([row[0] for row in cur.fetchall()])
         finally:
-            conn.close()
+            _release_connection(conn)
     path = Path(ensure_seed_file(filename))
     if not path.exists():
         return pd.DataFrame()
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype=LEAD_PHONE_DTYPES if filename == "leads.csv" else None)
     except (OSError, pd.errors.ParserError, UnicodeDecodeError):
         return pd.DataFrame()
 
@@ -696,7 +1096,7 @@ def append_sales_activity(activity: dict) -> bool:
     activity_id = str(payload.get("activity_id") or "").strip()
 
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 if activity_id:
@@ -715,7 +1115,7 @@ def append_sales_activity(activity: dict) -> bool:
                 inserted = cur.rowcount > 0
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
         if inserted:
             sync_database_to_csv("sales_activity.csv")
         return inserted
@@ -748,7 +1148,7 @@ def record_communication_event(event: dict) -> str:
         event_id = _generic_key(payload)
     payload["event_id"] = event_id
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -761,7 +1161,7 @@ def record_communication_event(event: dict) -> str:
                 )
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
         return event_id
     conn = _sqlite_autopilot_connection()
     try:
@@ -782,26 +1182,171 @@ def record_communication_event(event: dict) -> str:
         conn.close()
 
 
-def load_communication_events(limit: int = 500) -> pd.DataFrame:
-    """Read recent outbound and provider status events for CRM audit views."""
-    limit = max(1, min(int(limit), 5000))
+
+def get_communication_events(event_ids) -> dict:
+    """Load the exact send outcomes for the current review items."""
+    if not event_ids:
+        return {}
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM crm_communication_events ORDER BY (data ->> 'updated_at') DESC LIMIT %s",
-                    (limit,),
+                    "SELECT event_id, data FROM crm_communication_events WHERE event_id = ANY(%s)",
+                    (list(event_ids),),
+                )
+                return dict(cur.fetchall())
+        finally:
+            _release_connection(conn)
+    conn = _sqlite_autopilot_connection()
+    try:
+        placeholders = ", ".join("?" for _ in event_ids)
+        rows = conn.execute(
+            f"SELECT event_id, data FROM communication_events WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        return {key: json.loads(data) for key, data in rows}
+    finally:
+        conn.close()
+
+
+def claim_reviewed_email(event: dict) -> bool:
+    """Reserve a send before contacting SMTP. Only definite failures are retryable."""
+    event = _json_safe_row({**event, "status": "sending"})
+    event_id = event["event_id"]
+    if database_enabled():
+        conn = _borrow_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO crm_communication_events(event_id, provider_id, data)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (event_id) DO UPDATE SET
+                           provider_id = EXCLUDED.provider_id, data = EXCLUDED.data
+                           WHERE crm_communication_events.data ->> 'status' IN ('failed', 'blocked')
+                           RETURNING event_id""",
+                        (event_id, event["provider_id"], Json(event)),
+                    )
+                    return cur.fetchone() is not None
+        finally:
+            _release_connection(conn)
+    conn = _sqlite_autopilot_connection()
+    try:
+        with conn:
+            cursor = conn.execute(
+                """INSERT INTO communication_events(event_id, provider_id, data) VALUES (?, ?, ?)
+                   ON CONFLICT(event_id) DO UPDATE SET
+                   provider_id = excluded.provider_id, data = excluded.data
+                   WHERE json_extract(communication_events.data, '$.status') IN ('failed', 'blocked')""",
+                (event_id, event["provider_id"], json.dumps(event, ensure_ascii=False)),
+            )
+            return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def update_lead_email_outcome(destination, status, action, timestamp, event_id, expected_lead_key=""):
+    """Update the matched lead without rewriting its other fields or sales stage."""
+    def apply_changes(current):
+        matches = [
+            key for key, row in current.items()
+            if lead_cell(row.get("Email")).casefold() == destination.casefold()
+        ]
+        if len(matches) != 1:
+            return False, {}
+        key = matches[0]
+        row = current[key]
+        if expected_lead_key and lead_identity(row) != expected_lead_key:
+            return False, {}
+        previous_email_at = pd.to_datetime(row.get("Last Email At"), utc=True, errors="coerce")
+        event_time = pd.to_datetime(timestamp, utc=True, errors="coerce")
+        if pd.notna(previous_email_at) and previous_email_at > event_time:
+            return True, {}
+        updated = {
+            **row, "Email status": status, "Last Email Event": event_id,
+            "Last Email At": timestamp,
+        }
+        if status in {"Response sent", "Sent"}:
+            updated["Last Action"] = action
+            updated["Last Interaction"] = timestamp
+        current[key] = updated
+        return True, {key: updated}
+
+    return _write_leads(apply_changes)
+
+def load_communication_events(limit: int = 500, *, sent_email_only=False) -> pd.DataFrame:
+    """Read recent provider events or the CRM's accepted outbound mail."""
+    limit = max(1, min(int(limit), 5000))
+    if database_enabled():
+        conn = _borrow_connection()
+        try:
+            with conn.cursor() as cur:
+                condition = (
+                    "data ->> 'channel' = 'email' AND data ->> 'direction' = 'outbound' "
+                    "AND data ->> 'status' = 'accepted_by_smtp'"
+                    if sent_email_only else "event_id NOT LIKE 'mailbox-state:%%'"
+                )
+                cur.execute(
+                    f"SELECT data FROM crm_communication_events WHERE {condition} "
+                    "ORDER BY (data ->> 'updated_at') DESC LIMIT %s", (limit,),
                 )
                 return pd.DataFrame([row[0] for row in cur.fetchall()])
         finally:
-            conn.close()
+            _release_connection(conn)
+    conn = _sqlite_autopilot_connection()
+    try:
+        condition = (
+            "json_extract(data, '$.channel') = 'email' AND json_extract(data, '$.direction') = 'outbound' "
+            "AND json_extract(data, '$.status') = 'accepted_by_smtp'"
+            if sent_email_only else "event_id NOT LIKE 'mailbox-state:%'"
+        )
+        rows = conn.execute(
+            f"SELECT data FROM communication_events WHERE {condition} "
+            "ORDER BY json_extract(data, '$.updated_at') DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return pd.DataFrame([json.loads(row["data"]) for row in rows])
+    finally:
+        conn.close()
+
+
+def load_mailbox_drafts() -> list[dict]:
+    """Read saved new-message drafts from the same store as the review flags."""
+    if database_enabled():
+        conn = _borrow_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT data FROM crm_communication_events
+                       WHERE event_id LIKE 'mailbox-state:compose:%' AND data ->> 'draft_active' = 'true'"""
+                )
+                return [row[0] for row in cur.fetchall()]
+        finally:
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         rows = conn.execute(
-            "SELECT data FROM communication_events ORDER BY rowid DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return pd.DataFrame([json.loads(row["data"]) for row in rows])
+            """SELECT data FROM communication_events
+               WHERE event_id LIKE 'mailbox-state:compose:%' AND json_extract(data, '$.draft_active') = 1"""
+        )
+        return [json.loads(row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+def update_mailbox_state(event_id, **changes):
+    """Merge review flags and draft text without changing the original message."""
+    if database_enabled():
+        record_communication_event({"event_id": event_id, **changes})
+        return
+    conn = _sqlite_autopilot_connection()
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO communication_events(event_id, data) VALUES (?, ?)
+                   ON CONFLICT (event_id) DO UPDATE SET data = json_patch(communication_events.data, excluded.data)""",
+                (event_id, json.dumps({"event_id": event_id, **changes}, ensure_ascii=False)),
+            )
     finally:
         conn.close()
 
@@ -824,7 +1369,7 @@ def set_contact_suppression(destination: str, channel: str, reason: str, lead_ke
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -834,7 +1379,7 @@ def set_contact_suppression(destination: str, channel: str, reason: str, lead_ke
                 )
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
     else:
         conn = _sqlite_autopilot_connection()
         try:
@@ -851,14 +1396,14 @@ def set_contact_suppression(destination: str, channel: str, reason: str, lead_ke
 def load_contact_suppressions() -> pd.DataFrame:
     """Return active suppressed destinations for live send-time checks."""
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM crm_contact_suppressions")
                 rows = [row[0] for row in cur.fetchall()]
             return pd.DataFrame([row for row in rows if row.get("active", True)])
         finally:
-            conn.close()
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         rows = conn.execute("SELECT data FROM contact_suppressions").fetchall()
@@ -889,14 +1434,14 @@ def is_contact_suppressed(destination: str, channel: str) -> dict | None:
 def load_autopilot_actions() -> pd.DataFrame:
     """Read the persistent Autopilot review queue from PostgreSQL or local SQLite."""
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM crm_automation_actions ORDER BY row_key")
                 rows = [row[0] for row in cur.fetchall()]
             return pd.DataFrame(rows)
         finally:
-            conn.close()
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         rows = conn.execute(
@@ -912,7 +1457,7 @@ def queue_autopilot_actions(actions: list[dict]) -> int:
     if not actions:
         return 0
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         inserted = 0
         try:
             with conn.cursor() as cur:
@@ -929,7 +1474,7 @@ def queue_autopilot_actions(actions: list[dict]) -> int:
                     inserted += cur.rowcount
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
         return inserted
     conn = _sqlite_autopilot_connection()
     inserted = 0
@@ -959,7 +1504,7 @@ def claim_autopilot_action(task_id: str) -> dict | None:
         return None
     claimed_at = datetime.now(timezone.utc).isoformat()
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -992,7 +1537,7 @@ def claim_autopilot_action(task_id: str) -> dict | None:
             conn.commit()
             return task
         finally:
-            conn.close()
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1034,7 +1579,7 @@ def finish_autopilot_action(task_id: str, status: str, outcome: str) -> bool:
         raise ValueError("Unsupported Autopilot result status.")
     finished_at = datetime.now(timezone.utc).isoformat()
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1057,7 +1602,7 @@ def finish_autopilot_action(task_id: str, status: str, outcome: str) -> bool:
             conn.commit()
             return True
         finally:
-            conn.close()
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1128,7 +1673,7 @@ def retry_autopilot_action(task_id: str, confirmed_no_contact: bool = False) -> 
         return task, "Returned to staff review. Use the lead's normal contact action to retry."
 
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1150,7 +1695,7 @@ def retry_autopilot_action(task_id: str, confirmed_no_contact: bool = False) -> 
             conn.commit()
             return True, message
         finally:
-            conn.close()
+            _release_connection(conn)
 
     conn = _sqlite_autopilot_connection()
     try:
@@ -1175,7 +1720,7 @@ def retry_autopilot_action(task_id: str, confirmed_no_contact: bool = False) -> 
         conn.close()
 
 
-def resolve_autopilot_actions(lead_key: str, outcome: str) -> int:
+def resolve_autopilot_actions(lead_key: str, outcome: str, channel: str = "") -> int:
     """Resolve open review tasks after staff completes or dismisses the action."""
     lead_key = str(lead_key or "").strip()
     if not lead_key:
@@ -1183,7 +1728,7 @@ def resolve_autopilot_actions(lead_key: str, outcome: str) -> int:
     resolved_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     new_status = "Completed" if outcome != "Dismissed" else "Dismissed"
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         changed = 0
         try:
             with conn.cursor() as cur:
@@ -1194,6 +1739,8 @@ def resolve_autopilot_actions(lead_key: str, outcome: str) -> int:
                 for task_id, data in cur.fetchall():
                     if str(data.get("status", "")).casefold() != "needs review":
                         continue
+                    if channel and data.get("channel") != channel:
+                        continue
                     data.update({"status": new_status, "outcome": outcome, "resolved_at": resolved_at})
                     cur.execute(
                         "UPDATE crm_automation_actions SET data = %s WHERE row_key = %s",
@@ -1202,7 +1749,7 @@ def resolve_autopilot_actions(lead_key: str, outcome: str) -> int:
                     changed += 1
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
         return changed
     conn = _sqlite_autopilot_connection()
     try:
@@ -1211,15 +1758,19 @@ def resolve_autopilot_actions(lead_key: str, outcome: str) -> int:
             "SELECT task_id, data FROM autopilot_actions WHERE lead_key = ? AND lower(status) = 'needs review'",
             (lead_key,),
         ).fetchall()
+        changed = 0
         for row in rows:
             data = json.loads(row["data"])
+            if channel and data.get("channel") != channel:
+                continue
+            changed += 1
             data.update({"status": new_status, "outcome": outcome, "resolved_at": resolved_at})
             conn.execute(
                 "UPDATE autopilot_actions SET status = ?, data = ? WHERE task_id = ?",
                 (new_status, json.dumps(data, ensure_ascii=False, default=str), row["task_id"]),
             )
         conn.commit()
-        return len(rows)
+        return changed
     finally:
         conn.close()
 
@@ -1228,7 +1779,7 @@ def save_autopilot_worker_status(status: dict) -> None:
     """Persist the latest worker heartbeat and scan summary for the CRM screen."""
     payload = _json_safe_row(status)
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1240,7 +1791,7 @@ def save_autopilot_worker_status(status: dict) -> None:
                 )
             conn.commit()
         finally:
-            conn.close()
+            _release_connection(conn)
         return
     conn = _sqlite_autopilot_connection()
     try:
@@ -1259,14 +1810,14 @@ def save_autopilot_worker_status(status: dict) -> None:
 def load_autopilot_worker_status() -> dict:
     """Read the latest heartbeat and scan summary, if a worker has started."""
     if database_enabled():
-        conn = get_connection()
+        conn = _borrow_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM crm_settings WHERE row_key = %s", ("autopilot_worker",))
                 row = cur.fetchone()
             return row[0] if row and isinstance(row[0], dict) else {}
         finally:
-            conn.close()
+            _release_connection(conn)
     conn = _sqlite_autopilot_connection()
     try:
         conn.execute(

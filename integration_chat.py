@@ -121,7 +121,13 @@ def reconcile_saved_contacts(rows, store=None):
 def render_integration_panel(store=None):
     import pandas as pd
     import streamlit as st
-    with st.expander("Shared module connections", expanded=False):
+    panel = st.expander(
+        "Shared module connections", expanded=store is not None,
+        key="shared_module_connections", on_change="rerun",
+    )
+    if not panel.open:
+        return
+    with panel:
         if not enabled() and store is None:
             st.info("Shared integration is not enabled yet. The teammate connection guide is in INTEGRATION_GUIDE.md.")
             return

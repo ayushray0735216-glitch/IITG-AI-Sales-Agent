@@ -1,0 +1,46 @@
+.st-key-sharngon_customer_brand,
+.st-key-sharngon_login_brand,
+.st-key-sharngon_overview_brand {
+  padding: 1rem 1.3rem;
+  border: 1px solid #d9e2ed;
+  border-radius: 1.2rem;
+  background: linear-gradient(110deg, #ffffff 0%, #f4f8fc 72%, #f2ead9 100%);
+  box-shadow: 0 8px 25px #162b4112;
+}
+.st-key-sharngon_overview_brand {
+  background: linear-gradient(110deg, #142b3f 0%, #22475d 74%, #8b704c 100%);
+  border-color: #29475b;
+}
+.st-key-sharngon_customer_brand img,
+.st-key-sharngon_login_brand img,
+.st-key-sharngon_overview_brand img {
+  width: 104px !important;
+  height: 104px !important;
+  object-fit: cover;
+  object-position: center;
+  border-radius: 1.1rem;
+  box-shadow: 0 5px 16px #142b3f18;
+}
+.st-key-sharngon_customer_brand h1,
+.st-key-sharngon_login_brand h1,
+.st-key-sharngon_overview_brand h1 {
+  margin: 0;
+  color: #142b3f;
+  letter-spacing: -.035em;
+}
+.st-key-sharngon_overview_brand h1,
+.st-key-sharngon_overview_brand [data-testid="stCaptionContainer"] {
+  color: #fff !important;
+}
+.st-key-sharngon_customer_brand [data-testid="stCaptionContainer"],
+.st-key-sharngon_login_brand [data-testid="stCaptionContainer"] {
+  color: #4e6374;
+}
+@media (max-width: 640px) {
+  .st-key-sharngon_customer_brand img,
+  .st-key-sharngon_login_brand img,
+  .st-key-sharngon_overview_brand img {
+    width: 76px !important;
+    height: 76px !important;
+  }
+}
